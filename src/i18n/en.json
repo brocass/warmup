@@ -1,0 +1,8 @@
+{
+  "%n couldn't be read": { "one": "%n couldn't be read", "other": "%n couldn't be read" },
+  "%n songs sent to the helper": { "one": "%n song sent to the helper", "other": "%n songs sent to the helper" },
+  "%n already ready": { "one": "%n already ready", "other": "%n already ready" },
+  "%n not found in the helper's library": { "one": "%n not found in the helper's library", "other": "%n not found in the helper's library" },
+  "%n failed": { "one": "%n failed", "other": "%n failed" },
+  "%n songs in the library": { "one": "%n song in the library", "other": "%n songs in the library" }
+}

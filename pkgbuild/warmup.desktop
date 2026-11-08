@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Warmup
+Comment=Prepare Narjo Sing stems ahead of time
+Exec=warmup
+Icon=warmup
+Terminal=false
+Categories=Utility;AudioVideo;
+StartupWMClass=warmup
