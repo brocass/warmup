@@ -19,7 +19,8 @@ ApplicationWindow {
 
     property bool helpVisible: false
     property bool settingsVisible: !backend.configured
-    property bool shortcutsBlocked: settingsVisible
+    property bool playlistVisible: false
+    property bool shortcutsBlocked: settingsVisible || playlistVisible
     property color accentColor: theme.accent
 
     // Reads translator.language so the text re-renders on a language switch.
@@ -53,6 +54,7 @@ ApplicationWindow {
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; enabled: !win.shortcutsBlocked; onActivated: Qt.quit() }
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; enabled: !win.shortcutsBlocked; onActivated: backend.togglePause() }
     Shortcut { sequence: ","; context: Qt.ApplicationShortcut; enabled: !win.shortcutsBlocked; onActivated: win.settingsVisible = true }
+    Shortcut { sequence: "P"; context: Qt.ApplicationShortcut; enabled: !win.shortcutsBlocked; onActivated: win.playlistVisible = true }
     Shortcut {
         sequences: ["X", "Delete"]; context: Qt.ApplicationShortcut
         enabled: !win.shortcutsBlocked && list.currentItem && list.currentItem.cancellable
@@ -63,6 +65,8 @@ ApplicationWindow {
         onActivated: {
             if (win.helpVisible)
                 win.helpVisible = false
+            else if (win.playlistVisible)
+                win.playlistVisible = false
             else if (win.settingsVisible)
                 win.settingsVisible = false
         }
@@ -110,6 +114,11 @@ ApplicationWindow {
                     text: backend.helperLine
                     font.pixelSize: 13
                     opacity: 0.8
+                }
+                Button {
+                    text: qsTr("Playlist")
+                    flat: true
+                    onClicked: win.playlistVisible = true
                 }
                 Button {
                     text: qsTr("Settings")
@@ -248,16 +257,18 @@ ApplicationWindow {
                 spacing: 8
 
                 BusyIndicator {
-                    visible: backend.probingLeft > 0
+                    visible: backend.probingLeft > 0 || backend.downloadsLeft > 0
                     running: visible
                     Layout.preferredWidth: 22
                     Layout.preferredHeight: 22
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: backend.probingLeft > 0
-                          ? qsTr("Reading song details — %1 left").arg(backend.probingLeft)
-                          : backend.statusText
+                    text: backend.downloadsLeft > 0
+                          ? qsTr("Downloading instrumentals — %1 left").arg(backend.downloadsLeft)
+                          : backend.probingLeft > 0
+                            ? qsTr("Reading song details — %1 left").arg(backend.probingLeft)
+                            : backend.statusText
                     elide: Text.ElideRight
                     font.pixelSize: 12
                     opacity: 0.75
@@ -286,6 +297,12 @@ ApplicationWindow {
             anchors.fill: parent
             visible: win.settingsVisible
             onClosed: win.settingsVisible = false
+        }
+
+        PlaylistOverlay {
+            anchors.fill: parent
+            visible: win.playlistVisible
+            onClosed: win.playlistVisible = false
         }
     }
 }

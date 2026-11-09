@@ -4,5 +4,8 @@
   "%n already ready": { "one": "%n already ready", "other": "%n already ready" },
   "%n not found in the helper's library": { "one": "%n not found in the helper's library", "other": "%n not found in the helper's library" },
   "%n failed": { "one": "%n failed", "other": "%n failed" },
-  "%n songs in the library": { "one": "%n song in the library", "other": "%n songs in the library" }
+  "%n songs in the library": { "one": "%n song in the library", "other": "%n songs in the library" },
+  "Playlist updated — %n songs": { "one": "Playlist updated — %n song", "other": "Playlist updated — %n songs" },
+  "Karaoke playlist updated — %n songs": { "one": "Karaoke playlist updated — %n song", "other": "Karaoke playlist updated — %n songs" },
+  "%n couldn't be downloaded": { "one": "%n couldn't be downloaded", "other": "%n couldn't be downloaded" }
 }

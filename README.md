@@ -28,6 +28,26 @@ karaoke tracks in advance.
   to the helper at `batch` priority.
 - The list mirrors the helper's queue with live progress, and below it the
   songs that recently became ready.
+- Press **P** to have Warmup keep an M3U playlist of every processed track:
+  give the playlist file's full path (a bare name lands in your music folder)
+  and tick the box to have it rewritten automatically whenever new songs
+  become ready. Warmup discovers everything the helper has ever processed —
+  including songs prepared at your phone's request — by scanning your music
+  folder and asking the helper which stems exist. Saved inside your music
+  folder, the playlist keeps relative paths so a music server can read it.
+- Also under **P**: a karaoke library for players like Emby that can't
+  crossfade between vocal and instrumental stems. Warmup downloads the
+  instrumental for every processed song into one folder named after the
+  playlist (`<instrumentals folder>/<playlist name>/<Artist> - <Title>.m4a`),
+  writes the original's tags back (artist, title) with the **playlist name as
+  the album** — so Emby groups them as their own album instead of showing
+  duplicates of the originals — and copies each song's `.lrc` lyrics beside
+  it. A second M3U playlist of those files is written too; keep the
+  instrumentals folder *outside* your music folder so the helper and your
+  music server don't index the instrumentals as songs. Unchanged stems aren't
+  downloaded again (ETag), upgraded (Fast → Best) stems refresh on the next
+  update, and renaming the playlist retags and moves the files without
+  downloading anything.
 - Songs outside your music folder are matched by file name and tags; unique
   file names work best.
 
@@ -37,6 +57,7 @@ karaoke tracks in advance.
 | ----- | ----------------------------- |
 | Space | Pause or resume the queue     |
 | X     | Cancel the selected song      |
+| P     | Open playlist options         |
 | ,     | Open settings                 |
 | ?     | Show or hide the shortcut help |
 | Q     | Quit                          |

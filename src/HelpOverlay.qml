@@ -42,6 +42,7 @@ Item {
                     model: [
                         ["Space", qsTr("Pause or resume the queue")],
                         ["X", qsTr("Cancel the selected song")],
+                        ["P", qsTr("Open playlist options")],
                         [",", qsTr("Open settings")],
                         ["?", qsTr("Show or hide this help")],
                         ["Q", qsTr("Quit")]

@@ -3,6 +3,7 @@
         <file alias="Main.qml">Main.qml</file>
         <file alias="HelpOverlay.qml">HelpOverlay.qml</file>
         <file alias="SettingsOverlay.qml">SettingsOverlay.qml</file>
+        <file alias="PlaylistOverlay.qml">PlaylistOverlay.qml</file>
         <file alias="i18n/en.json">i18n/en.json</file>
     </qresource>
 </RCC>

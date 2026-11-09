@@ -145,3 +145,24 @@ SongInfo Metadata::parseProbe(const QString &filePath, const QByteArray &ffprobe
     song.ok = true;
     return song;
 }
+
+QJsonObject Metadata::songInfoToJson(const SongInfo &song) {
+    return QJsonObject{{"filePath", song.filePath},       {"matchPath", song.matchPath},
+                       {"title", song.title},             {"albumArtist", song.albumArtist},
+                       {"album", song.album},             {"disc", song.disc},
+                       {"track", song.track},             {"durationSeconds", song.durationSeconds}};
+}
+
+SongInfo Metadata::songInfoFromJson(const QJsonObject &json) {
+    SongInfo song;
+    song.filePath = json.value("filePath").toString();
+    song.matchPath = json.value("matchPath").toString();
+    song.title = json.value("title").toString();
+    song.albumArtist = json.value("albumArtist").toString();
+    song.album = json.value("album").toString();
+    song.disc = json.value("disc").toInt();
+    song.track = json.value("track").toInt();
+    song.durationSeconds = json.value("durationSeconds").toInt();
+    song.ok = song.durationSeconds > 0;
+    return song;
+}

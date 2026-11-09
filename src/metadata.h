@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QJsonObject>
 #include <QString>
 #include <QStringList>
 #include <QUrl>
@@ -27,4 +28,7 @@ namespace Metadata {
     QStringList collectAudioFiles(const QList<QUrl> &urls);
     SongInfo parseProbe(const QString &filePath, const QByteArray &ffprobeJson, const QString &musicRoot);
     QString matchPathFor(const QString &filePath, const QString &musicRoot);
+    // Storage shape for the song store; the helper API shape lives in Backend.
+    QJsonObject songInfoToJson(const SongInfo &song);
+    SongInfo songInfoFromJson(const QJsonObject &json);
 }

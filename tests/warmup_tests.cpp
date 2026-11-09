@@ -6,6 +6,7 @@
 #include "backend.h"
 #include "metadata.h"
 #include "settings.h"
+#include "songstore.h"
 #include "theme.h"
 #include "translator.h"
 
@@ -19,6 +20,13 @@ private slots:
         qunsetenv("WARMUP_ACCESS_KEY");
         qunsetenv("WARMUP_MUSIC_ROOT");
         qunsetenv("WARMUP_QUALITY");
+        qunsetenv("WARMUP_PLAYLIST_ENABLED");
+        qunsetenv("WARMUP_PLAYLIST_PATH");
+        qunsetenv("WARMUP_KARAOKE_ENABLED");
+        qunsetenv("WARMUP_KARAOKE_PATH");
+        qunsetenv("WARMUP_KARAOKE_DIRECTORY");
+        qunsetenv("WARMUP_STORE_PATH");
+        qunsetenv("WARMUP_KARAOKE_STORE_PATH");
     }
 
     void backendBuildsSongJson()
@@ -176,6 +184,144 @@ private slots:
         qunsetenv("WARMUP_QUALITY");
     }
 
+    void settingsPlaylistRoundTrip()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("config.json");
+        Settings first(path);
+        QCOMPARE(first.playlistEnabled(), false);
+        QCOMPARE(first.playlistPath(), first.musicRoot() + "/Sing ready.m3u"); // default
+
+        first.applyPlaylist(true, "/music/Playlists/Karaoke Night");
+        QCOMPARE(first.playlistPath(), QString("/music/Playlists/Karaoke Night.m3u"));
+
+        Settings second(path);
+        QCOMPARE(second.playlistEnabled(), true);
+        QCOMPARE(second.playlistPath(), QString("/music/Playlists/Karaoke Night.m3u"));
+
+        // An empty path falls back to the default.
+        second.applyPlaylist(true, "");
+        QCOMPARE(second.playlistPath(), second.musicRoot() + "/Sing ready.m3u");
+    }
+
+    void settingsMigratesFolderAndNameToPath()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("config.json");
+        write(path, R"({"musicRoot": "/music", "playlistEnabled": true,
+                        "playlistName": "Narjo Karaoke", "playlistDirectory": "/music/Playlists",
+                        "karaokeEnabled": true, "karaokeName": "Sing karaoke"})");
+
+        Settings settings(path);
+        QCOMPARE(settings.playlistPath(), QString("/music/Playlists/Narjo Karaoke.m3u"));
+        QCOMPARE(settings.karaokePath(), QString("/music/Playlists/Sing karaoke.m3u"));
+    }
+
+    void storeKeepsSubmittedSongs()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("songs.json");
+        SongStore store(path);
+        store.add(probeSong("/music/Band/Album/one.mp3", "One"));
+        store.add(probeSong("/music/Band/Album/two.mp3", "Two"));
+        QCOMPARE(store.songs().size(), 2);
+
+        SongStore reloaded(path);
+        QCOMPARE(reloaded.songs().size(), 2);
+        QVERIFY(reloaded.contains("/music/Band/Album/one.mp3"));
+
+        // Re-adding the same file updates it in place and keeps better data.
+        SongInfo updated = probeSong("/music/Band/Album/one.mp3", "");
+        updated.durationSeconds = 0;
+        store.add(updated);
+        QCOMPARE(store.songs().size(), 2);
+        QCOMPARE(store.songs().first().title, QString("One"));
+        QCOMPARE(store.songs().first().durationSeconds, 213);
+    }
+
+    void playlistPathNormalized()
+    {
+        QCOMPARE(Settings::normalizePlaylistPath("Karaoke Night", "/music"), QString("/music/Karaoke Night.m3u"));
+        QCOMPARE(Settings::normalizePlaylistPath("/data/lists/already.m3u", "/music"),
+                 QString("/data/lists/already.m3u"));
+        QCOMPARE(Settings::normalizePlaylistPath("sub/dir/list", "/music"), QString("/music/sub/dir/list.m3u"));
+        QCOMPARE(Settings::normalizePlaylistPath("", "/music"), QString());
+        QCOMPARE(Settings::normalizePlaylistPath("  /data/x.m3u  ", "/music"), QString("/data/x.m3u"));
+    }
+
+    void playlistPathsStayRelativeInsideTheMusicFolder()
+    {
+        QCOMPARE(Backend::playlistPathFor("/music/Band/song.mp3", "/music", "/music"),
+                 QString("Band/song.mp3"));
+        QCOMPARE(Backend::playlistPathFor("/music/Band/song.mp3", "/music/Playlists", "/music"),
+                 QString("../Band/song.mp3"));
+        QCOMPARE(Backend::playlistPathFor("/music/Band/song.mp3", "/home/x/Playlists", "/music"),
+                 QString("/music/Band/song.mp3"));
+    }
+
+    void playlistM3uContent()
+    {
+        QVector<SongInfo> songs{probeSong("/music/Band/Album/two.mp3", "Two"),
+                                probeSong("/music/Band/Album/one.mp3", "One")};
+        songs[0].albumArtist.clear(); // "Two" has no artist tag
+        const QString m3u = Backend::buildM3u(songs, [](const SongInfo &song) {
+            return Backend::playlistPathFor(song.filePath, "/music", "/music");
+        });
+        const QStringList lines = m3u.split('\n');
+        QCOMPARE(lines.first(), QString("#EXTM3U"));
+        // Sorted by match path, one EXTINF (duration, artist - title) per song.
+        QCOMPARE(lines.value(1), QString("#EXTINF:213,The Test Band - One"));
+        QCOMPARE(lines.value(2), QString("Band/Album/one.mp3"));
+        QCOMPARE(lines.value(3), QString("#EXTINF:213,Two"));
+        QCOMPARE(lines.value(4), QString("Band/Album/two.mp3"));
+        QVERIFY(m3u.endsWith('\n'));
+    }
+
+    void karaokePathsFlattenIntoTheCollection()
+    {
+        // One folder per playlist, files named by artist and title.
+        QCOMPARE(Backend::karaokePathFor(probeSong("/music/Band/Album/03 Song.mp3", "Song"), "/karaoke",
+                                         "Sing karaoke"),
+                 QString("/karaoke/Sing karaoke/The Test Band - Song.m4a"));
+        // Without an artist tag the title stands alone.
+        SongInfo untagged = probeSong("/music/Band/Album/04 Solo.mp3", "Solo");
+        untagged.albumArtist.clear();
+        QCOMPARE(Backend::karaokePathFor(untagged, "/karaoke", "Sing karaoke"),
+                 QString("/karaoke/Sing karaoke/Solo.m4a"));
+        // Characters that break other operating systems' shares are replaced.
+        QCOMPARE(Backend::karaokePathFor(probeSong("/music/A:B?/Al\"bum/03 S*ong.mp3", "S*ong"), "/karaoke",
+                                         "My/List"),
+                 QString("/karaoke/My-List/The Test Band - S-ong.m4a"));
+    }
+
+    void karaokePlaylistPathsAreRelativeOnlyInsideTheFolder()
+    {
+        QCOMPARE(Backend::relativeIfInside("/music/Instrumentals/x.m4a", "/music"),
+                 QString("Instrumentals/x.m4a"));
+        QCOMPARE(Backend::relativeIfInside("/home/x/Karaoke/x.m4a", "/music"),
+                 QString("/home/x/Karaoke/x.m4a"));
+    }
+
+    void settingsKaraokeRoundTrip()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("config.json");
+        Settings first(path);
+        QCOMPARE(first.karaokeEnabled(), false);
+        QCOMPARE(first.karaokePath(), first.musicRoot() + "/Sing karaoke.m3u");
+        QCOMPARE(first.karaokeDirectory(), QDir::homePath() + "/Karaoke");
+
+        first.applyKaraoke(true, "lists/Karaoke night", "/data/karaoke");
+        Settings second(path);
+        QCOMPARE(second.karaokeEnabled(), true);
+        QCOMPARE(second.karaokePath(), second.musicRoot() + "/lists/Karaoke night.m3u");
+        QCOMPARE(second.karaokeDirectory(), QString("/data/karaoke"));
+
+        second.applyKaraoke(true, "", "");
+        QCOMPARE(second.karaokePath(), second.musicRoot() + "/Sing karaoke.m3u");
+        QCOMPARE(second.karaokeDirectory(), QDir::homePath() + "/Karaoke");
+    }
+
     void themeFallsBack()
     {
         QTemporaryDir dir;
@@ -255,6 +401,21 @@ private:
     }
 
     static void touch(const QString &path) { write(path, "x"); }
+
+    static SongInfo probeSong(const QString &filePath, const QString &title)
+    {
+        SongInfo song;
+        song.filePath = filePath;
+        song.matchPath = Metadata::matchPathFor(filePath, "/music");
+        song.title = title;
+        song.albumArtist = "The Test Band";
+        song.album = "Midnight Parade";
+        song.track = 3;
+        song.disc = 1;
+        song.durationSeconds = 213;
+        song.ok = true;
+        return song;
+    }
 };
 
 QTEST_MAIN(WarmupTests)
