@@ -18,6 +18,7 @@ public:
 
     QVector<SongInfo> songs() const { return m_songs; }
     bool contains(const QString &filePath) const { return m_index.contains(filePath); }
+    SongInfo get(const QString &filePath) const;
     void add(const SongInfo &song);
     void addAll(const QVector<SongInfo> &songs);
 

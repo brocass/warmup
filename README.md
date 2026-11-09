@@ -35,6 +35,8 @@ karaoke tracks in advance.
   including songs prepared at your phone's request — by scanning your music
   folder and asking the helper which stems exist. Saved inside your music
   folder, the playlist keeps relative paths so a music server can read it.
+  On big libraries (thousands of songs) the first full check takes a few
+  minutes; later updates only re-check what changed.
 - Also under **P**: a karaoke library for players like Emby that can't
   crossfade between vocal and instrumental stems. Warmup downloads the
   instrumental for every processed song into one folder named after the

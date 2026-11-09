@@ -81,7 +81,7 @@ public:
                                    const QString &quality);
     Q_INVOKABLE void applyPlaylistSettings(bool enabled, const QString &path);
     Q_INVOKABLE void applyKaraokeSettings(bool enabled, const QString &path, const QString &directory);
-    Q_INVOKABLE void updatePlaylist();
+    Q_INVOKABLE void updatePlaylist(); // manual trigger: full readiness check
 
     // Static, so tests can drive them without a server.
     static QJsonObject songToJson(const SongInfo &song);
@@ -92,6 +92,7 @@ public:
     static QString playlistPathFor(const QString &filePath, const QString &playlistDir, const QString &musicRoot);
     static QString relativeIfInside(const QString &path, const QString &directory);
     static QString karaokePathFor(const SongInfo &song, const QString &karaokeDir, const QString &collection);
+    static QVector<QJsonObject> buildLookupBodies(const QVector<SongInfo> &songs);
     static QString buildM3u(const QVector<SongInfo> &songs,
                             const std::function<QString(const SongInfo &)> &pathFor);
 
@@ -107,15 +108,24 @@ private:
     void reconnect();
     void fetchHealth();
     void fetchQueue();
-    void post(const QString &path, const QJsonDocument &body, const std::function<void(const QJsonValue &)> &done,
-              const std::function<void()> &failed = {});
+    void post(const QString &path, const QJsonDocument &body, qint64 timeoutMs,
+              const std::function<void(const QJsonValue &)> &done, const std::function<void()> &failed = {});
+    // Posts request bodies with limited concurrency — the helper answers a
+    // 200-song lookup in seconds, and a fire-all-at-once burst would time out.
+    void postChunks(const QString &path, const QVector<QJsonObject> &bodies, int concurrency, qint64 timeoutMs,
+                    const std::function<void(const QJsonValue &)> &each, const std::function<void()> &allDone,
+                    const std::function<void()> &failed);
     bool handleReply(QNetworkReply *reply, QJsonValue *parsed);
     bool replyFailedFatally(QNetworkReply *reply);
     void setStatus(const QString &text);
     void pumpProbes();
     void probeFinished(QProcess *probe, const QString &path, bool forPlaylist);
     void flushBatch();
-    void startLookups();
+    void updatePlaylistInternal(bool forceFull);
+    void startLookups(bool full);
+    void writeFromReady();
+    void loadReady();
+    void saveReady() const;
     QVector<SongInfo> writePlaylist(const QVector<SongInfo> &ready);
 
     // The karaoke library: instrumentals downloaded from the helper, remuxed
@@ -167,11 +177,14 @@ private:
     bool m_seenQueueSnapshot = false;
     QTimer m_playlistDebounce;
     QElapsedTimer m_libraryScanTimer; // throttles full music-folder walks
+    QElapsedTimer m_fullLookupTimer;  // throttles full-library readiness checks
     bool m_playlistUpdatePending = false;
+    bool m_nextLookupFull = false;
     bool m_lookupRunning = false;
     bool m_lookupFailed = false;
     int m_lookupChunksLeft = 0;
-    QSet<QString> m_readyPaths;
+    QSet<QString> m_readyPaths; // cached and persisted: the helper's processed songs
+    QString m_readyStorePath;
 
     struct DownloadJob {
         SongInfo song;

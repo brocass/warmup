@@ -26,6 +26,11 @@ QString SongStore::defaultPath() {
     return QDir::homePath() + "/.local/share/warmup/songs.json";
 }
 
+SongInfo SongStore::get(const QString &filePath) const {
+    const auto it = m_index.constFind(filePath);
+    return it == m_index.constEnd() ? SongInfo() : m_songs[it.value()];
+}
+
 void SongStore::add(const SongInfo &song) {
     if (song.filePath.isEmpty())
         return;
@@ -40,6 +45,8 @@ void SongStore::add(const SongInfo &song) {
             merged.durationSeconds = m_songs[existing.value()].durationSeconds;
         if (merged.matchPath.isEmpty())
             merged.matchPath = m_songs[existing.value()].matchPath;
+        if (merged.probeVersion < m_songs[existing.value()].probeVersion)
+            merged.probeVersion = m_songs[existing.value()].probeVersion;
         m_songs[existing.value()] = merged;
     } else {
         if (m_songs.size() >= kMaxSongs) {

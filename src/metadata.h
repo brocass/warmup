@@ -17,6 +17,7 @@ struct SongInfo {
     int track = 0;
     int durationSeconds = 0;
     bool ok = false;    // false when ffprobe couldn't read the file as audio
+    int probeVersion = 0; // 0 = probed before frame-counted mp3 durations
 };
 
 namespace Metadata {
@@ -28,6 +29,9 @@ namespace Metadata {
     QStringList collectAudioFiles(const QList<QUrl> &urls);
     SongInfo parseProbe(const QString &filePath, const QByteArray &ffprobeJson, const QString &musicRoot);
     QString matchPathFor(const QString &filePath, const QString &musicRoot);
+    // Samples in one mp3 frame: 576 for MPEG-2/2.5 (≤ 24 kHz), 1152 for MPEG-1.
+    int mp3SamplesPerFrame(int sampleRate);
+    constexpr int kProbeVersion = 1;
     // Storage shape for the song store; the helper API shape lives in Backend.
     QJsonObject songInfoToJson(const SongInfo &song);
     SongInfo songInfoFromJson(const QJsonObject &json);

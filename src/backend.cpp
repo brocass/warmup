@@ -6,6 +6,7 @@
 #include <QNetworkReply>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSharedPointer>
 
 namespace {
 // The helper accepts at most this many songs per lookup, so batches stay
@@ -28,13 +29,17 @@ Backend::Backend(QObject *parent) : QObject(parent), m_store(qEnvironmentVariabl
     if (m_karaokePath.isEmpty())
         m_karaokePath = QDir::homePath() + "/.local/share/warmup/karaoke.json";
     loadKaraoke();
+    m_readyStorePath = qEnvironmentVariable("WARMUP_READY_STORE_PATH");
+    if (m_readyStorePath.isEmpty())
+        m_readyStorePath = QDir::homePath() + "/.local/share/warmup/ready.json";
+    loadReady();
     m_healthTimer.setInterval(10000);
     connect(&m_healthTimer, &QTimer::timeout, this, &Backend::fetchHealth);
     m_queueTimer.setInterval(2000);
     connect(&m_queueTimer, &QTimer::timeout, this, &Backend::fetchQueue);
     m_playlistDebounce.setSingleShot(true);
     m_playlistDebounce.setInterval(3000);
-    connect(&m_playlistDebounce, &QTimer::timeout, this, &Backend::updatePlaylist);
+    connect(&m_playlistDebounce, &QTimer::timeout, this, [this] { updatePlaylistInternal(false); });
     connect(&m_settings, &Settings::changed, this, [this] {
         m_blocked = false;
         reconnect();
@@ -221,7 +226,7 @@ void Backend::fetchQueue() {
     });
 }
 
-void Backend::post(const QString &path, const QJsonDocument &body,
+void Backend::post(const QString &path, const QJsonDocument &body, qint64 timeoutMs,
                    const std::function<void(const QJsonValue &)> &done, const std::function<void()> &failed) {
     if (m_blocked || !m_settings.isConfigured()) {
         if (failed)
@@ -230,6 +235,7 @@ void Backend::post(const QString &path, const QJsonDocument &body,
     }
     QNetworkRequest req = request(path);
     req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setTransferTimeout(timeoutMs);
     QNetworkReply *reply = m_nam.post(req, body.toJson(QJsonDocument::Compact));
     connect(reply, &QNetworkReply::finished, this, [this, reply, done, failed] {
         QJsonValue parsed;
@@ -240,15 +246,47 @@ void Backend::post(const QString &path, const QJsonDocument &body,
     });
 }
 
+void Backend::postChunks(const QString &path, const QVector<QJsonObject> &bodies, int concurrency,
+                         qint64 timeoutMs, const std::function<void(const QJsonValue &)> &each,
+                         const std::function<void()> &allDone, const std::function<void()> &failed) {
+    struct State {
+        int next = 0, running = 0;
+        bool stopped = false;
+    };
+    auto state = QSharedPointer<State>::create();
+    auto pump = QSharedPointer<std::function<void()>>::create();
+    *pump = [this, path, bodies, concurrency, timeoutMs, each, allDone, failed, state, pump]() {
+        while (!state->stopped && state->running < concurrency && state->next < bodies.size()) {
+            const int i = state->next++;
+            ++state->running;
+            post(path, QJsonDocument(bodies[i]), timeoutMs,
+                 [each, state, pump](const QJsonValue &value) {
+                     each(value);
+                     --state->running;
+                     (*pump)();
+                 },
+                 [state, failed]() {
+                     if (state->stopped)
+                         return;
+                     state->stopped = true;
+                     failed();
+                 });
+        }
+        if (!state->stopped && state->running == 0 && state->next >= bodies.size())
+            allDone();
+    };
+    (*pump)();
+}
+
 void Backend::togglePause() {
-    post(m_paused ? "/v1/queue/resume" : "/v1/queue/pause", QJsonDocument(),
+    post(m_paused ? "/v1/queue/resume" : "/v1/queue/pause", QJsonDocument(), 15000,
          [this](const QJsonValue &) { fetchQueue(); });
 }
 
 void Backend::cancelJob(const QString &jobId) {
     if (jobId.isEmpty())
         return;
-    post("/v1/jobs/" + jobId + "/cancel", QJsonDocument(), [this](const QJsonValue &) { fetchQueue(); });
+    post("/v1/jobs/" + jobId + "/cancel", QJsonDocument(), 15000, [this](const QJsonValue &) { fetchQueue(); });
 }
 
 void Backend::applySettings(const QString &helperUrl, const QString &accessKey, const QString &musicRoot,
@@ -289,9 +327,16 @@ void Backend::pumpProbes() {
         m_probes.insert(probe, forPlaylist);
         connect(probe, &QProcess::finished, this,
                 [this, probe, path, forPlaylist] { probeFinished(probe, path, forPlaylist); });
-        // ffprobe prints one JSON object with the duration and every tag.
-        probe->start("ffprobe", {"-v", "error", "-print_format", "json", "-show_entries",
-                                 "format=duration:format_tags", "--", path});
+        // ffprobe prints one JSON object with the duration and every tag; for
+        // mp3s it also counts frames, because its container estimate can be
+        // badly wrong for broken VBR headers (the helper indexes true length).
+        QStringList args{"-v", "error", "-print_format", "json"};
+        if (path.endsWith(".mp3", Qt::CaseInsensitive))
+            args << "-count_frames" << "-select_streams" << "a:0" << "-show_entries"
+                 << "format=duration:format_tags:stream=nb_read_frames,sample_rate";
+        else
+            args << "-show_entries" << "format=duration:format_tags";
+        probe->start("ffprobe", QStringList(args) << "--" << path);
     }
 }
 
@@ -324,7 +369,8 @@ void Backend::probeFinished(QProcess *probe, const QString &path, bool forPlayli
         }
         if (m_playlistUpdatePending) {
             m_playlistUpdatePending = false;
-            startLookups();
+            startLookups(m_nextLookupFull);
+            m_nextLookupFull = false;
         }
     }
     emit probingChanged();
@@ -356,7 +402,9 @@ void Backend::flushBatch() {
         songs.append(songToJson(chunk.last()));
     }
     const QJsonObject body{{"songs", songs}, {"priority", "batch"}, {"quality", m_settings.quality()}};
-    post("/v1/jobs/batch", QJsonDocument(body), [this, chunk](const QJsonValue &response) {
+    // Matching against the library index makes batch submission as slow as a
+    // lookup on big libraries, so it gets the long timeout too.
+    post("/v1/jobs/batch", QJsonDocument(body), 120000, [this, chunk](const QJsonValue &response) {
         const Tally tally = tallyBatchResponse(response.toArray());
         QStringList parts;
         if (tally.added > 0)
@@ -415,6 +463,10 @@ void Backend::applyKaraokeSettings(bool enabled, const QString &path, const QStr
 }
 
 void Backend::updatePlaylist() {
+    updatePlaylistInternal(true); // a manual save or apply re-checks everything
+}
+
+void Backend::updatePlaylistInternal(bool forceFull) {
     if (!m_settings.isConfigured()) {
         setStatus(tr("Set up the helper connection first — press ,"));
         return;
@@ -424,18 +476,40 @@ void Backend::updatePlaylist() {
         return;
     }
 
+    QSet<QString> queued(m_probeQueue.begin(), m_probeQueue.end());
+    queued.unite(QSet<QString>(m_playlistProbeQueue.begin(), m_playlistProbeQueue.end()));
+
+    // Durations from ffprobe's old container estimate are wrong for some
+    // mp3s, so every mp3 probed before the frame-counting probe gets one
+    // more pass; without it the helper can't match those songs.
+    for (const auto &song : m_store.songs())
+        if (song.probeVersion < Metadata::kProbeVersion &&
+            song.filePath.endsWith(".mp3", Qt::CaseInsensitive) && !queued.contains(song.filePath) &&
+            QFileInfo::exists(song.filePath)) {
+            m_playlistProbeQueue.append(song.filePath);
+            queued.insert(song.filePath);
+        }
+
     // Discover every song the helper might have processed — including ones
     // prepared long ago or at the phone's request that fell out of the
     // queue's recent list — by walking the whole music folder. New files are
     // probed so the readiness lookup has their title and duration. Walking is
     // cheap, but on a big or remote library it isn't free, so it's throttled.
+    bool foundNew = false;
     if (!m_libraryScanTimer.isValid() || m_libraryScanTimer.elapsed() > 10 * 60 * 1000) {
         m_libraryScanTimer.start();
+        const QString karaokeRoot = QDir::cleanPath(m_settings.karaokeDirectory());
         const QStringList library = Metadata::collectAudioFiles({QUrl::fromLocalFile(m_settings.musicRoot())});
-        for (const QString &file : library)
-            if (!m_store.contains(file) && !m_probeQueue.contains(file) &&
-                !m_playlistProbeQueue.contains(file))
+        for (const QString &file : library) {
+            // Our own instrumentals are not source songs.
+            if (!karaokeRoot.isEmpty() && file.startsWith(karaokeRoot + "/"))
+                continue;
+            if (!m_store.contains(file) && !queued.contains(file)) {
                 m_playlistProbeQueue.append(file);
+                queued.insert(file);
+                foundNew = true;
+            }
+        }
     }
 
     // Songs seen in the queue's "recent" list but never submitted from here
@@ -444,10 +518,11 @@ void Backend::updatePlaylist() {
     QVector<SongInfo> known;
     for (const QString &relPath : m_recentPaths) {
         const QString filePath = m_settings.musicRoot() + "/" + relPath;
-        if (m_store.contains(filePath) || m_playlistProbeQueue.contains(filePath))
+        if (m_store.contains(filePath) || queued.contains(filePath))
             continue;
         if (QFileInfo::exists(filePath)) {
             m_playlistProbeQueue.append(filePath);
+            foundNew = true;
         } else {
             SongInfo song;
             song.filePath = filePath;
@@ -458,73 +533,134 @@ void Backend::updatePlaylist() {
     }
     if (!known.isEmpty())
         m_store.addAll(known);
+
+    // A full check of the whole library is expensive (seconds per 200-song
+    // chunk on the helper), so it runs on demand, hourly, and whenever new
+    // songs were found; routine "a song became ready" events only re-check
+    // the fresh ones and merge into the cached ready set.
+    m_nextLookupFull = forceFull || foundNew || !m_fullLookupTimer.isValid() ||
+                       m_fullLookupTimer.elapsed() > 60 * 60 * 1000;
     if (!m_playlistProbeQueue.isEmpty()) {
         m_playlistUpdatePending = true;
         pumpProbes();
         emit probingChanged();
         return;
     }
-    startLookups();
+    startLookups(m_nextLookupFull);
+    m_nextLookupFull = false;
 }
 
-void Backend::startLookups() {
-    // Entries without a duration (ready songs heard about through the queue,
-    // whose files aren't local) would fail validation for the whole chunk.
-    QVector<SongInfo> songs;
-    for (const auto &song : m_store.songs())
-        if (song.durationSeconds > 0)
-            songs.append(song);
-    if (songs.isEmpty()) {
-        setStatus(tr("No ready songs yet"));
-        return;
-    }
-
-    m_lookupRunning = true;
-    m_lookupFailed = false;
-    m_readyPaths.clear();
-    // "recent" entries have stems by definition, whatever the lookup says.
-    for (const QString &relPath : m_recentPaths)
-        m_readyPaths.insert(m_settings.musicRoot() + "/" + relPath);
-
-    m_lookupChunksLeft = (songs.size() + kBatchSize - 1) / kBatchSize;
+QVector<QJsonObject> Backend::buildLookupBodies(const QVector<SongInfo> &songs) {
+    QVector<QJsonObject> bodies;
     for (int offset = 0; offset < songs.size(); offset += kBatchSize) {
         QJsonArray chunk;
         for (int i = offset; i < qMin(offset + kBatchSize, songs.size()); ++i)
             chunk.append(songToJson(songs[i]));
         // "auto" counts a song as ready no matter which tier its stems are.
-        const QJsonObject body{{"songs", chunk}, {"quality", "auto"}};
-        post("/v1/stems/lookup", QJsonDocument(body),
-             [this](const QJsonValue &response) {
-                 for (const auto &value : response.toArray()) {
-                     const QJsonObject result = value.toObject();
-                     if (result.value("ready").toBool())
-                         m_readyPaths.insert(result.value("clientSongId").toString());
-                 }
-                 if (--m_lookupChunksLeft == 0) {
-                     m_lookupRunning = false;
-                     if (!m_lookupFailed) {
-                         QVector<SongInfo> ready;
-                         for (const auto &song : m_store.songs())
-                             if (m_readyPaths.contains(song.filePath))
-                                 ready.append(song);
-                         if (m_settings.playlistEnabled())
-                             writePlaylist(ready);
-                         if (m_settings.karaokeEnabled() && !ready.isEmpty())
-                             startKaraoke(ready);
-                         else
-                             checkKaraokeDone();
-                     } else {
-                         checkKaraokeDone();
-                     }
-                 }
-             },
-             [this] {
-                 // Without every answer the ready set would be incomplete and
-                 // the rewritten playlist could lose songs, so skip this round.
-                 m_lookupFailed = true;
-                 if (--m_lookupChunksLeft == 0)
-                     m_lookupRunning = false;
-             });
+        bodies.append(QJsonObject{{"songs", chunk}, {"quality", "auto"}});
+    }
+    return bodies;
+}
+
+void Backend::startLookups(bool full) {
+    QVector<SongInfo> candidates;
+    if (full) {
+        m_fullLookupTimer.start();
+        for (const auto &song : m_store.songs())
+            if (song.durationSeconds > 0) // invalid entries fail the whole chunk
+                candidates.append(song);
+    } else {
+        // Just the fresh queue sightings we have real metadata for; entries
+        // without it are force-included through the recent union anyway.
+        for (const QString &relPath : m_recentPaths) {
+            const SongInfo song = m_store.get(m_settings.musicRoot() + "/" + relPath);
+            if (song.durationSeconds > 0 && !m_readyPaths.contains(song.filePath))
+                candidates.append(song);
+        }
+    }
+
+    // "recent" entries have stems by definition, whatever the lookup says.
+    QSet<QString> recentUnion;
+    for (const QString &relPath : m_recentPaths)
+        recentUnion.insert(m_settings.musicRoot() + "/" + relPath);
+    if (!full)
+        m_readyPaths.unite(recentUnion);
+
+    if (candidates.isEmpty()) {
+        if (full)
+            m_readyPaths = recentUnion;
+        saveReady();
+        writeFromReady();
+        return;
+    }
+    if (full)
+        setStatus(tr("Checking which songs the helper has processed…"));
+
+    m_lookupRunning = true;
+    m_lookupFailed = false;
+    m_lookupChunksLeft = (candidates.size() + kBatchSize - 1) / kBatchSize;
+    auto collected = QSharedPointer<QSet<QString>>::create();
+    postChunks("/v1/stems/lookup", buildLookupBodies(candidates), 3, 120000,
+               [this, collected](const QJsonValue &response) {
+                   for (const auto &value : response.toArray()) {
+                       const QJsonObject result = value.toObject();
+                       if (result.value("ready").toBool())
+                           collected->insert(result.value("clientSongId").toString());
+                   }
+                   --m_lookupChunksLeft;
+               },
+               [this, collected, full, recentUnion] {
+                   m_lookupRunning = false;
+                   if (full) {
+                       m_readyPaths = *collected;
+                       m_readyPaths.unite(recentUnion);
+                   } else {
+                       m_readyPaths.unite(*collected);
+                   }
+                   saveReady();
+                   writeFromReady();
+               },
+               [this] {
+                   // Without every answer the ready set would be incomplete
+                   // and the rewritten playlists could lose songs, so skip
+                   // this round; the next trigger tries again.
+                   m_lookupFailed = true;
+                   m_lookupRunning = false;
+                   checkKaraokeDone();
+               });
+}
+
+void Backend::writeFromReady() {
+    QVector<SongInfo> ready;
+    for (const auto &song : m_store.songs())
+        if (m_readyPaths.contains(song.filePath))
+            ready.append(song);
+    if (m_settings.playlistEnabled())
+        writePlaylist(ready);
+    if (m_settings.karaokeEnabled() && !ready.isEmpty())
+        startKaraoke(ready);
+    else
+        checkKaraokeDone();
+}
+
+void Backend::loadReady() {
+    QFile file(m_readyStorePath);
+    if (!file.open(QIODevice::ReadOnly))
+        return;
+    const QJsonArray array = QJsonDocument::fromJson(file.readAll()).array();
+    for (const auto &value : array)
+        m_readyPaths.insert(value.toString());
+}
+
+void Backend::saveReady() const {
+    QJsonArray array;
+    for (const QString &path : m_readyPaths)
+        array.append(path);
+    QDir().mkpath(QFileInfo(m_readyStorePath).absolutePath());
+    QSaveFile file(m_readyStorePath);
+    if (file.open(QIODevice::WriteOnly)) {
+        file.write(QJsonDocument(array).toJson(QJsonDocument::Compact));
+        file.commit();
     }
 }
 
@@ -593,39 +729,40 @@ void Backend::startKaraoke(const QVector<SongInfo> &readySongs) {
         if (song.durationSeconds > 0)
             valid.append(song);
 
-    m_karaokeChunksLeft = (valid.size() + kBatchSize - 1) / kBatchSize;
     if (valid.isEmpty()) {
         checkKaraokeDone();
         return;
     }
+    QVector<QJsonObject> bodies;
+    QHash<QString, SongInfo> byId;
     for (int offset = 0; offset < valid.size(); offset += kBatchSize) {
         QJsonArray chunk;
-        QHash<QString, SongInfo> byId;
         for (int i = offset; i < qMin(offset + kBatchSize, valid.size()); ++i) {
             chunk.append(songToJson(valid[i]));
             byId.insert(valid[i].filePath, valid[i]);
         }
-        const QJsonObject body{{"songs", chunk}, {"priority", "batch"}, {"quality", "auto"}};
-        post("/v1/jobs/batch", QJsonDocument(body),
-             [this, byId](const QJsonValue &response) {
-                 for (const auto &value : response.toArray()) {
-                     const QJsonObject result = value.toObject();
-                     const QString filePath = result.value("clientSongId").toString();
-                     const QString jobId = result.value("jobId").toString();
-                     if (result.value("state").toString() == "done" && !jobId.isEmpty() && byId.contains(filePath))
-                         m_downloadQueue.append({byId.value(filePath), jobId});
-                 }
-                 if (--m_karaokeChunksLeft == 0)
-                     pumpDownloads();
-                 emit downloadsChanged();
-             },
-             [this] {
-                 // Without the job ids no download can start; try again on the
-                 // next trigger rather than writing a stale playlist.
-                 m_karaokeChunksLeft = 0;
-                 checkKaraokeDone();
-             });
+        bodies.append(QJsonObject{{"songs", chunk}, {"priority", "batch"}, {"quality", "auto"}});
     }
+    m_karaokeChunksLeft = bodies.size();
+    postChunks("/v1/jobs/batch", bodies, 3, 120000,
+               [this, byId](const QJsonValue &response) {
+                   for (const auto &value : response.toArray()) {
+                       const QJsonObject result = value.toObject();
+                       const QString filePath = result.value("clientSongId").toString();
+                       const QString jobId = result.value("jobId").toString();
+                       if (result.value("state").toString() == "done" && !jobId.isEmpty() && byId.contains(filePath))
+                           m_downloadQueue.append({byId.value(filePath), jobId});
+                   }
+                   --m_karaokeChunksLeft;
+                   emit downloadsChanged();
+               },
+               [this] { pumpDownloads(); },
+               [this] {
+                   // Without the job ids no download can start; try again on
+                   // the next trigger rather than writing a stale playlist.
+                   m_karaokeChunksLeft = 0;
+                   checkKaraokeDone();
+               });
     emit downloadsChanged();
 }
 

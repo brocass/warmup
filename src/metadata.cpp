@@ -5,6 +5,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSet>
@@ -116,13 +117,27 @@ SongInfo Metadata::parseProbe(const QString &filePath, const QByteArray &ffprobe
     song.matchPath = matchPathFor(filePath, musicRoot);
     song.title = QFileInfo(filePath).completeBaseName();
 
-    const QJsonObject format = QJsonDocument::fromJson(ffprobeJson).object().value("format").toObject();
+    const QJsonDocument doc = QJsonDocument::fromJson(ffprobeJson);
+    const QJsonObject format = doc.object().value("format").toObject();
     if (format.isEmpty())
         return song;
 
-    song.durationSeconds = int(format.value("duration").toString().toDouble() + 0.5);
+    double duration = format.value("duration").toString().toDouble();
+    // ffprobe's container estimate can be badly wrong for mp3s with broken
+    // VBR headers (the helper indexes the true length), so an mp3 probe also
+    // asks ffprobe to count frames, which matches the decodable length.
+    const QJsonArray streams = doc.object().value("streams").toArray();
+    if (!streams.isEmpty()) {
+        const QJsonObject stream = streams.first().toObject();
+        const qlonglong frames = stream.value("nb_read_frames").toVariant().toLongLong();
+        const int rate = stream.value("sample_rate").toVariant().toInt();
+        if (frames > 0 && rate > 0)
+            duration = double(frames) * mp3SamplesPerFrame(rate) / rate;
+    }
+    song.durationSeconds = int(duration + 0.5);
     if (song.durationSeconds <= 0)
         return song;
+    song.probeVersion = kProbeVersion;
 
     // Tag keys differ by container (FLAC often uppercases them), so look them
     // up case-insensitively.
@@ -146,11 +161,16 @@ SongInfo Metadata::parseProbe(const QString &filePath, const QByteArray &ffprobe
     return song;
 }
 
+int Metadata::mp3SamplesPerFrame(int sampleRate) {
+    return sampleRate > 0 && sampleRate <= 24000 ? 576 : 1152;
+}
+
 QJsonObject Metadata::songInfoToJson(const SongInfo &song) {
     return QJsonObject{{"filePath", song.filePath},       {"matchPath", song.matchPath},
                        {"title", song.title},             {"albumArtist", song.albumArtist},
                        {"album", song.album},             {"disc", song.disc},
-                       {"track", song.track},             {"durationSeconds", song.durationSeconds}};
+                       {"track", song.track},             {"durationSeconds", song.durationSeconds},
+                       {"probeVersion", song.probeVersion}};
 }
 
 SongInfo Metadata::songInfoFromJson(const QJsonObject &json) {
@@ -164,5 +184,6 @@ SongInfo Metadata::songInfoFromJson(const QJsonObject &json) {
     song.track = json.value("track").toInt();
     song.durationSeconds = json.value("durationSeconds").toInt();
     song.ok = song.durationSeconds > 0;
+    song.probeVersion = json.value("probeVersion").toInt();
     return song;
 }

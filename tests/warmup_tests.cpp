@@ -148,6 +148,41 @@ private slots:
         QVERIFY(!Metadata::parseProbe("/music/bad.mp3", R"({"format":{}})", "/music").ok);
     }
 
+    void metadataCountsMp3FramesForDuration()
+    {
+        // An mp3 whose container estimate (423 s) is wrong: the frame count
+        // gives the true, decodable length (257 s) that the helper indexes.
+        const QByteArray json = R"({"streams":[{"nb_read_frames":"9855","sample_rate":"44100"}],
+            "format":{"duration":"423.252433","tags":{"TITLE":"Skin & Bones"}}})";
+        const SongInfo song = Metadata::parseProbe("/music/song.mp3", json, "/music");
+        QVERIFY(song.ok);
+        QCOMPARE(song.durationSeconds, 257);
+        QCOMPARE(song.probeVersion, Metadata::kProbeVersion);
+
+        QCOMPARE(Metadata::mp3SamplesPerFrame(44100), 1152);
+        QCOMPARE(Metadata::mp3SamplesPerFrame(48000), 1152);
+        QCOMPARE(Metadata::mp3SamplesPerFrame(22050), 576);
+        QCOMPARE(Metadata::mp3SamplesPerFrame(12000), 576);
+
+        // Without a streams array (other formats) the container duration stands.
+        const SongInfo flac = Metadata::parseProbe("/music/song.flac", R"({"format":{"duration":"60.2"}})", "/music");
+        QCOMPARE(flac.durationSeconds, 60);
+        QCOMPARE(flac.probeVersion, Metadata::kProbeVersion);
+    }
+
+    void metadataJsonKeepsProbeVersion()
+    {
+        SongInfo song;
+        song.filePath = "/music/x.mp3";
+        song.title = "x";
+        song.durationSeconds = 100;
+        song.probeVersion = Metadata::kProbeVersion;
+        QCOMPARE(Metadata::songInfoFromJson(Metadata::songInfoToJson(song)).probeVersion,
+                 Metadata::kProbeVersion);
+        // Entries written before the field existed load as version 0.
+        QCOMPARE(Metadata::songInfoFromJson(QJsonObject{{"filePath", "/music/x.mp3"}}).probeVersion, 0);
+    }
+
     void settingsRoundTrip()
     {
         QTemporaryDir dir;
@@ -237,6 +272,29 @@ private slots:
         QCOMPARE(store.songs().size(), 2);
         QCOMPARE(store.songs().first().title, QString("One"));
         QCOMPARE(store.songs().first().durationSeconds, 213);
+    }
+
+    void lookupBodiesSplitIntoChunks()
+    {
+        QVector<SongInfo> songs;
+        for (int i = 0; i < 450; ++i)
+            songs.append(probeSong(QString("/music/Band/song%1.mp3").arg(i), QString("Song %1").arg(i)));
+        const QVector<QJsonObject> bodies = Backend::buildLookupBodies(songs);
+        QCOMPARE(bodies.size(), 3); // 200 + 200 + 50
+        QCOMPARE(bodies.first().value("quality").toString(), QString("auto"));
+        QCOMPARE(bodies.first().value("songs").toArray().size(), 200);
+        QCOMPARE(bodies.last().value("songs").toArray().size(), 50);
+        QCOMPARE(bodies.last().value("songs").toArray().first().toObject().value("title").toString(),
+                 QString("Song 400"));
+    }
+
+    void storeGetsSingleSongs()
+    {
+        QTemporaryDir dir;
+        SongStore store(dir.filePath("songs.json"));
+        store.add(probeSong("/music/Band/one.mp3", "One"));
+        QCOMPARE(store.get("/music/Band/one.mp3").title, QString("One"));
+        QVERIFY(store.get("/music/Band/nope.mp3").filePath.isEmpty());
     }
 
     void playlistPathNormalized()
