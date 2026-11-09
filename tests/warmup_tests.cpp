@@ -150,14 +150,18 @@ private slots:
 
     void metadataCountsMp3FramesForDuration()
     {
-        // An mp3 whose container estimate (423 s) is wrong: the frame count
-        // gives the true, decodable length (257 s) that the helper indexes.
-        const QByteArray json = R"({"streams":[{"nb_read_frames":"9855","sample_rate":"44100"}],
+        // An mp3 whose container estimate (423 s) is wrong: the audio frame
+        // count gives the true, decodable length (257 s) that the helper
+        // indexes. The cover-art stream must not be mistaken for audio.
+        const QByteArray json = R"({"streams":[
+            {"codec_type":"video","nb_read_frames":"1"},
+            {"codec_type":"audio","nb_read_frames":"9855","sample_rate":"44100"}],
             "format":{"duration":"423.252433","tags":{"TITLE":"Skin & Bones"}}})";
         const SongInfo song = Metadata::parseProbe("/music/song.mp3", json, "/music");
         QVERIFY(song.ok);
         QCOMPARE(song.durationSeconds, 257);
         QCOMPARE(song.probeVersion, Metadata::kProbeVersion);
+        QVERIFY(song.hasEmbeddedArt);
 
         QCOMPARE(Metadata::mp3SamplesPerFrame(44100), 1152);
         QCOMPARE(Metadata::mp3SamplesPerFrame(48000), 1152);
@@ -168,6 +172,43 @@ private slots:
         const SongInfo flac = Metadata::parseProbe("/music/song.flac", R"({"format":{"duration":"60.2"}})", "/music");
         QCOMPARE(flac.durationSeconds, 60);
         QCOMPARE(flac.probeVersion, Metadata::kProbeVersion);
+        QVERIFY(!flac.hasEmbeddedArt);
+    }
+
+    void metadataReadsTrackArtist()
+    {
+        const QByteArray json = R"({"format":{"duration":"200.1","tags":{
+            "TITLE":"Pick A Part","ARTIST":"Stereophonics","ALBUM_ARTIST":"Various Artists"}}})";
+        const SongInfo song = Metadata::parseProbe("/music/comp/song.mp3", json, "/music");
+        QCOMPARE(song.artist, QString("Stereophonics"));
+        QCOMPARE(song.albumArtist, QString("Various Artists")); // the helper matches on this one
+
+        // Single-artist albums usually have no album_artist tag; it falls back.
+        const SongInfo solo = Metadata::parseProbe(
+            "/music/solo/song.mp3", R"({"format":{"duration":"200.1","tags":{"ARTIST":"The Sundays"}}})", "/music");
+        QCOMPARE(solo.albumArtist, QString("The Sundays"));
+    }
+
+    void karaokePrefersTrackArtist()
+    {
+        SongInfo song = probeSong("/music/comp/song.mp3", "Pick A Part");
+        song.artist = "Stereophonics";
+        song.albumArtist = "Various Artists";
+        QCOMPARE(Backend::karaokeArtist(song), QString("Stereophonics"));
+        QCOMPARE(Backend::karaokePathFor(song, "/karaoke", "Sing karaoke"),
+                 QString("/karaoke/Sing karaoke/Stereophonics - Pick A Part.m4a"));
+        song.artist.clear();
+        QCOMPARE(Backend::karaokeArtist(song), QString("Various Artists"));
+    }
+
+    void folderCoverIsFoundNextToTheSong()
+    {
+        QTemporaryDir dir;
+        touch(dir.filePath("song.mp3"));
+        QCOMPARE(Backend::folderCoverFor(dir.filePath("song.mp3")), QString());
+        touch(dir.filePath("notes.jpg"));
+        touch(dir.filePath("Folder.JPG"));
+        QCOMPARE(Backend::folderCoverFor(dir.filePath("song.mp3")), dir.filePath("Folder.JPG"));
     }
 
     void metadataJsonKeepsProbeVersion()
@@ -175,12 +216,18 @@ private slots:
         SongInfo song;
         song.filePath = "/music/x.mp3";
         song.title = "x";
+        song.artist = "a";
         song.durationSeconds = 100;
+        song.hasEmbeddedArt = true;
         song.probeVersion = Metadata::kProbeVersion;
-        QCOMPARE(Metadata::songInfoFromJson(Metadata::songInfoToJson(song)).probeVersion,
-                 Metadata::kProbeVersion);
-        // Entries written before the field existed load as version 0.
-        QCOMPARE(Metadata::songInfoFromJson(QJsonObject{{"filePath", "/music/x.mp3"}}).probeVersion, 0);
+        const SongInfo loaded = Metadata::songInfoFromJson(Metadata::songInfoToJson(song));
+        QCOMPARE(loaded.probeVersion, Metadata::kProbeVersion);
+        QCOMPARE(loaded.artist, QString("a"));
+        QVERIFY(loaded.hasEmbeddedArt);
+        // Entries written before the fields existed load with defaults.
+        const SongInfo legacy = Metadata::songInfoFromJson(QJsonObject{{"filePath", "/music/x.mp3"}});
+        QCOMPARE(legacy.probeVersion, 0);
+        QVERIFY(!legacy.hasEmbeddedArt);
     }
 
     void settingsRoundTrip()

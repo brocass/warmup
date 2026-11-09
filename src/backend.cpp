@@ -327,15 +327,16 @@ void Backend::pumpProbes() {
         m_probes.insert(probe, forPlaylist);
         connect(probe, &QProcess::finished, this,
                 [this, probe, path, forPlaylist] { probeFinished(probe, path, forPlaylist); });
-        // ffprobe prints one JSON object with the duration and every tag; for
-        // mp3s it also counts frames, because its container estimate can be
-        // badly wrong for broken VBR headers (the helper indexes true length).
+        // ffprobe prints one JSON object with the duration, every tag, and
+        // each stream's type (cover art is a video stream); for mp3s it also
+        // counts frames, because its container estimate can be badly wrong
+        // for broken VBR headers (the helper indexes true length).
         QStringList args{"-v", "error", "-print_format", "json"};
         if (path.endsWith(".mp3", Qt::CaseInsensitive))
-            args << "-count_frames" << "-select_streams" << "a:0" << "-show_entries"
-                 << "format=duration:format_tags:stream=nb_read_frames,sample_rate";
+            args << "-count_frames" << "-show_entries"
+                 << "format=duration:format_tags:stream=codec_type,sample_rate,nb_read_frames";
         else
-            args << "-show_entries" << "format=duration:format_tags";
+            args << "-show_entries" << "format=duration:format_tags:stream=codec_type";
         probe->start("ffprobe", QStringList(args) << "--" << path);
     }
 }
@@ -479,13 +480,12 @@ void Backend::updatePlaylistInternal(bool forceFull) {
     QSet<QString> queued(m_probeQueue.begin(), m_probeQueue.end());
     queued.unite(QSet<QString>(m_playlistProbeQueue.begin(), m_playlistProbeQueue.end()));
 
-    // Durations from ffprobe's old container estimate are wrong for some
-    // mp3s, so every mp3 probed before the frame-counting probe gets one
-    // more pass; without it the helper can't match those songs.
+    // Older probes lack what newer versions read (true mp3 durations, the
+    // track artist, embedded-art presence), so every song probed before the
+    // current version gets one more pass.
     for (const auto &song : m_store.songs())
-        if (song.probeVersion < Metadata::kProbeVersion &&
-            song.filePath.endsWith(".mp3", Qt::CaseInsensitive) && !queued.contains(song.filePath) &&
-            QFileInfo::exists(song.filePath)) {
+        if (song.probeVersion < Metadata::kProbeVersion && !queued.contains(song.filePath) &&
+            Metadata::isAudioFile(song.filePath) && QFileInfo::exists(song.filePath)) {
             m_playlistProbeQueue.append(song.filePath);
             queued.insert(song.filePath);
         }
@@ -683,6 +683,12 @@ QString Backend::relativeIfInside(const QString &path, const QString &directory)
     return clean;
 }
 
+// The track's own artist (the real group on compilations) rather than the
+// album's umbrella artist ("Various Artists").
+QString Backend::karaokeArtist(const SongInfo &song) {
+    return song.artist.isEmpty() ? song.albumArtist : song.artist;
+}
+
 // Instrumentals live flat in one folder per karaoke playlist
 // (<karaokeDir>/<collection>/<Artist> - <Title>.m4a) instead of mirroring
 // the library's artist/album tree: music players then see them as their own
@@ -696,9 +702,24 @@ QString Backend::karaokePathFor(const SongInfo &song, const QString &karaokeDir,
     QString name = song.title;
     if (name.isEmpty())
         name = QFileInfo(song.filePath).completeBaseName();
-    if (!song.albumArtist.isEmpty())
-        name = song.albumArtist + " - " + name;
+    const QString artist = karaokeArtist(song);
+    if (!artist.isEmpty())
+        name = artist + " - " + name;
     return QDir::cleanPath(karaokeDir) + "/" + clean(collection) + "/" + clean(name) + ".m4a";
+}
+
+// The cover image music servers conventionally look for next to the song.
+QString Backend::folderCoverFor(const QString &songPath) {
+    static const QStringList names{"cover", "folder", "front", "album", "artwork"};
+    const QDir dir = QFileInfo(songPath).dir();
+    const QStringList files = dir.entryList(QDir::Files, QDir::Name);
+    for (const QString &file : files) {
+        const QString suffix = QFileInfo(file).suffix().toLower();
+        if ((suffix == "jpg" || suffix == "jpeg" || suffix == "png") &&
+            names.contains(QFileInfo(file).completeBaseName().toLower()))
+            return dir.absoluteFilePath(file);
+    }
+    return {};
 }
 
 QString Backend::buildM3u(const QVector<SongInfo> &songs,
@@ -857,17 +878,32 @@ void Backend::startRemux(const SongInfo &song, const QByteArray &bytes, const QS
     process->start("ffmpeg", remuxArgs(song, job.tmpIn, job.tmpOut));
 }
 
-// The helper's stems carry no tags, so the original's are written back —
-// except the album, which becomes the karaoke playlist's name so players
-// group these as their own album instead of duplicating the originals.
+// The helper's stems carry no tags, so the original's are written back:
+// the track's own artist and title, the album's umbrella artist kept as
+// album_artist (compilation convention), and the album replaced by the
+// karaoke playlist's name so players group these as their own album. The
+// original's cover comes along too — its embedded stream if it has one, or
+// the album folder's cover image otherwise.
 QStringList Backend::remuxArgs(const SongInfo &song, const QString &input, const QString &output) const {
-    QStringList args{"-v", "error", "-y", "-i", input, "-c:a", "copy"};
+    QStringList args{"-v", "error", "-y", "-i", input};
+    QString artInput;
+    if (song.hasEmbeddedArt)
+        artInput = song.filePath;
+    else
+        artInput = folderCoverFor(song.filePath);
+    if (!artInput.isEmpty())
+        args << "-i" << artInput << "-map" << "0:a" << "-map" << "1:v:0";
+    else
+        args << "-map" << "0:a";
+    args << "-c" << "copy";
+    if (!artInput.isEmpty())
+        args << "-disposition:v:0" << "attached_pic";
     auto tag = [&args](const char *key, const QString &value) {
         if (!value.isEmpty())
             args << "-metadata" << QString("%1=%2").arg(key, value);
     };
     tag("title", song.title);
-    tag("artist", song.albumArtist);
+    tag("artist", karaokeArtist(song));
     tag("album_artist", song.albumArtist);
     tag("album", karaokeCollection());
     args << output;
@@ -910,6 +946,7 @@ void Backend::remuxFinished(QProcess *process) {
         entry.instrumentalPath = job.final;
         entry.etag = job.etag;
         entry.collection = karaokeCollection();
+        entry.tagVersion = kKaraokeTagVersion;
         if (previous != m_karaoke.constEnd()) {
             entry.lrcSourceMtime = previous->lrcSourceMtime;
             if (previous->instrumentalPath != job.final) {
@@ -947,12 +984,15 @@ void Backend::remuxFinished(QProcess *process) {
 // plainly when only the folder changed.
 void Backend::relocateKaraokeFile(const SongInfo &song, KaraokeEntry &entry) {
     const QString want = karaokePathFor(song, m_settings.karaokeDirectory(), karaokeCollection());
-    if (entry.instrumentalPath == want || !QFileInfo::exists(entry.instrumentalPath))
-        return;
-    if (entry.collection != karaokeCollection()) {
-        startRetag(song, entry);
+    // Anything outdated (renamed collection, older tagging, missing art) is
+    // rebuilt from the existing file instead of downloading it again.
+    if (entry.collection != karaokeCollection() || entry.tagVersion < kKaraokeTagVersion) {
+        if (QFileInfo::exists(entry.instrumentalPath))
+            startRetag(song, entry);
         return;
     }
+    if (entry.instrumentalPath == want || !QFileInfo::exists(entry.instrumentalPath))
+        return;
     const QString oldDirectory = QFileInfo(entry.instrumentalPath).absolutePath();
     QDir().mkpath(QFileInfo(want).absolutePath());
     QFile::remove(want);
@@ -1060,6 +1100,7 @@ void Backend::loadKaraoke() {
         entry.instrumentalPath = value.value("instrumentalPath").toString();
         entry.etag = value.value("etag").toString();
         entry.collection = value.value("collection").toString();
+        entry.tagVersion = value.value("tagVersion").toInt();
         entry.lrcPath = value.value("lrcPath").toString();
         entry.lrcSourceMtime = qlonglong(value.value("lrcSourceMtime").toDouble());
         if (!entry.instrumentalPath.isEmpty())
@@ -1073,6 +1114,7 @@ void Backend::saveKaraoke() const {
         object.insert(it.key(), QJsonObject{{"instrumentalPath", it->instrumentalPath},
                                             {"etag", it->etag},
                                             {"collection", it->collection},
+                                            {"tagVersion", it->tagVersion},
                                             {"lrcPath", it->lrcPath},
                                             {"lrcSourceMtime", double(it->lrcSourceMtime)}});
     }

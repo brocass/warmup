@@ -41,15 +41,19 @@ karaoke tracks in advance.
   crossfade between vocal and instrumental stems. Warmup downloads the
   instrumental for every processed song into one folder named after the
   playlist (`<instrumentals folder>/<playlist name>/<Artist> - <Title>.m4a`),
-  writes the original's tags back (artist, title) with the **playlist name as
-  the album** — so Emby groups them as their own album instead of showing
-  duplicates of the originals — and copies each song's `.lrc` lyrics beside
-  it. A second M3U playlist of those files is written too; keep the
-  instrumentals folder *outside* your music folder so the helper and your
-  music server don't index the instrumentals as songs. Unchanged stems aren't
-  downloaded again (ETag), upgraded (Fast → Best) stems refresh on the next
-  update, and renaming the playlist retags and moves the files without
-  downloading anything.
+  writes the original's tags back — the track's own **artist** (the real group
+  on "Various Artists" compilations), the title, the original album artist
+  kept as `album_artist`, and the **playlist name as the album**, so Emby
+  groups them as their own album instead of showing duplicates of the
+  originals. The original's **cover art is embedded** too: its embedded
+  stream when the file has one, or the album folder's
+  `cover/folder/front/album/artwork.jpg|png` otherwise. Each song's `.lrc`
+  lyrics are copied beside it. A second M3U playlist of those files is
+  written too; keep the instrumentals folder *outside* your music folder so
+  the helper and your music server don't index the instrumentals as songs.
+  Unchanged stems aren't downloaded again (ETag), upgraded (Fast → Best)
+  stems refresh on the next update, and renaming the playlist retags and
+  moves the files without downloading anything.
 - Songs outside your music folder are matched by file name and tags; unique
   file names work best.
 

@@ -15,14 +15,18 @@
 
 // One downloaded instrumental: where it lives and how fresh it is, so an
 // unchanged stem (same ETag) isn't downloaded again. The collection is the
-// playlist name written into its album tag and folder.
+// playlist name written into its album tag and folder; tagVersion marks how
+// the file was tagged (artist fields, embedded art) so older files are
+// retagged in place.
 struct KaraokeEntry {
     QString instrumentalPath;
     QString etag;
     QString collection;
+    int tagVersion = 0;
     QString lrcPath;
     qlonglong lrcSourceMtime = 0;
 };
+constexpr int kKaraokeTagVersion = 1;
 
 // Talks to the narjo-sing-helper REST API: turns dropped files into batch
 // jobs, mirrors the helper's queue so the window can show progress, and keeps
@@ -91,7 +95,9 @@ public:
     static Tally tallyBatchResponse(const QJsonArray &results);
     static QString playlistPathFor(const QString &filePath, const QString &playlistDir, const QString &musicRoot);
     static QString relativeIfInside(const QString &path, const QString &directory);
+    static QString karaokeArtist(const SongInfo &song);
     static QString karaokePathFor(const SongInfo &song, const QString &karaokeDir, const QString &collection);
+    static QString folderCoverFor(const QString &songPath);
     static QVector<QJsonObject> buildLookupBodies(const QVector<SongInfo> &songs);
     static QString buildM3u(const QVector<SongInfo> &songs,
                             const std::function<QString(const SongInfo &)> &pathFor);

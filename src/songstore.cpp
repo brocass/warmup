@@ -45,6 +45,8 @@ void SongStore::add(const SongInfo &song) {
             merged.durationSeconds = m_songs[existing.value()].durationSeconds;
         if (merged.matchPath.isEmpty())
             merged.matchPath = m_songs[existing.value()].matchPath;
+        if (merged.artist.isEmpty())
+            merged.artist = m_songs[existing.value()].artist;
         if (merged.probeVersion < m_songs[existing.value()].probeVersion)
             merged.probeVersion = m_songs[existing.value()].probeVersion;
         m_songs[existing.value()] = merged;

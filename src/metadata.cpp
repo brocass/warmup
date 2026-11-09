@@ -127,13 +127,20 @@ SongInfo Metadata::parseProbe(const QString &filePath, const QByteArray &ffprobe
     // VBR headers (the helper indexes the true length), so an mp3 probe also
     // asks ffprobe to count frames, which matches the decodable length.
     const QJsonArray streams = doc.object().value("streams").toArray();
-    if (!streams.isEmpty()) {
-        const QJsonObject stream = streams.first().toObject();
-        const qlonglong frames = stream.value("nb_read_frames").toVariant().toLongLong();
-        const int rate = stream.value("sample_rate").toVariant().toInt();
-        if (frames > 0 && rate > 0)
-            duration = double(frames) * mp3SamplesPerFrame(rate) / rate;
+    qlonglong audioFrames = 0;
+    int audioRate = 0;
+    for (const auto &value : streams) {
+        const QJsonObject stream = value.toObject();
+        const QString type = stream.value("codec_type").toString();
+        if (type == "video")
+            song.hasEmbeddedArt = true;
+        else if (type == "audio" && audioFrames <= 0) {
+            audioFrames = stream.value("nb_read_frames").toVariant().toLongLong();
+            audioRate = stream.value("sample_rate").toVariant().toInt();
+        }
     }
+    if (audioFrames > 0 && audioRate > 0)
+        duration = double(audioFrames) * mp3SamplesPerFrame(audioRate) / audioRate;
     song.durationSeconds = int(duration + 0.5);
     if (song.durationSeconds <= 0)
         return song;
@@ -149,6 +156,7 @@ SongInfo Metadata::parseProbe(const QString &filePath, const QByteArray &ffprobe
     auto number = [](const QString &value) { return value.section('/', 0, 0).trimmed().toInt(); };
     if (!folded.value("title").isEmpty())
         song.title = folded.value("title");
+    song.artist = folded.value("artist");
     song.albumArtist = folded.value("album_artist");
     if (song.albumArtist.isEmpty())
         song.albumArtist = folded.value("albumartist");
@@ -167,9 +175,11 @@ int Metadata::mp3SamplesPerFrame(int sampleRate) {
 
 QJsonObject Metadata::songInfoToJson(const SongInfo &song) {
     return QJsonObject{{"filePath", song.filePath},       {"matchPath", song.matchPath},
-                       {"title", song.title},             {"albumArtist", song.albumArtist},
-                       {"album", song.album},             {"disc", song.disc},
-                       {"track", song.track},             {"durationSeconds", song.durationSeconds},
+                       {"title", song.title},             {"artist", song.artist},
+                       {"albumArtist", song.albumArtist}, {"album", song.album},
+                       {"disc", song.disc},               {"track", song.track},
+                       {"durationSeconds", song.durationSeconds},
+                       {"hasEmbeddedArt", song.hasEmbeddedArt},
                        {"probeVersion", song.probeVersion}};
 }
 
@@ -178,12 +188,14 @@ SongInfo Metadata::songInfoFromJson(const QJsonObject &json) {
     song.filePath = json.value("filePath").toString();
     song.matchPath = json.value("matchPath").toString();
     song.title = json.value("title").toString();
+    song.artist = json.value("artist").toString();
     song.albumArtist = json.value("albumArtist").toString();
     song.album = json.value("album").toString();
     song.disc = json.value("disc").toInt();
     song.track = json.value("track").toInt();
     song.durationSeconds = json.value("durationSeconds").toInt();
     song.ok = song.durationSeconds > 0;
+    song.hasEmbeddedArt = json.value("hasEmbeddedArt").toBool();
     song.probeVersion = json.value("probeVersion").toInt();
     return song;
 }
