@@ -20,6 +20,7 @@ private slots:
         qunsetenv("WARMUP_ACCESS_KEY");
         qunsetenv("WARMUP_MUSIC_ROOT");
         qunsetenv("WARMUP_QUALITY");
+        qunsetenv("WARMUP_CONFIG_PATH");
         qunsetenv("WARMUP_PLAYLIST_ENABLED");
         qunsetenv("WARMUP_PLAYLIST_PATH");
         qunsetenv("WARMUP_KARAOKE_ENABLED");
@@ -27,6 +28,9 @@ private slots:
         qunsetenv("WARMUP_KARAOKE_DIRECTORY");
         qunsetenv("WARMUP_STORE_PATH");
         qunsetenv("WARMUP_KARAOKE_STORE_PATH");
+        qunsetenv("WARMUP_READY_STORE_PATH");
+        qunsetenv("WARMUP_SERVICE_ENABLED");
+        qunsetenv("WARMUP_DISABLE_SERVICE");
     }
 
     void backendBuildsSongJson()
@@ -266,6 +270,41 @@ private slots:
         qunsetenv("WARMUP_QUALITY");
     }
 
+    void settingsServiceRoundTrip()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("config.json");
+        Settings first(path);
+        QVERIFY(!first.serviceEnabled());
+        first.applyService(true);
+        QVERIFY(first.serviceEnabled());
+
+        Settings second(path);
+        QVERIFY(second.serviceEnabled());
+        second.applyService(false);
+        QVERIFY(!Settings(path).serviceEnabled());
+    }
+
+    void serviceClassifiesSystemdState()
+    {
+        using State = Service::State;
+        QCOMPARE(int(Service::classify("active", "enabled", true)), int(State::Active));
+        QCOMPARE(int(Service::classify("inactive", "enabled", true)), int(State::Inactive));
+        QCOMPARE(int(Service::classify("failed", "enabled", true)), int(State::Failed));
+        QCOMPARE(int(Service::classify("inactive", "", true)), int(State::NotInstalled));
+        QCOMPARE(int(Service::classify("active", "enabled", false)), int(State::Unknown));
+        // While systemd auto-restarts a crashed service it isn't "down" yet.
+        QCOMPARE(int(Service::classify("activating", "enabled", true)), int(State::Active));
+        QCOMPARE(int(Service::classify("deactivating", "enabled", true)), int(State::Active));
+
+        QVERIFY(Service::unitFileIsEnabled("enabled"));
+        QVERIFY(Service::unitFileIsEnabled("enabled-runtime"));
+        QVERIFY(Service::unitFileIsEnabled("static"));
+        QVERIFY(!Service::unitFileIsEnabled("disabled"));
+        QVERIFY(!Service::unitFileIsEnabled("masked"));
+        QCOMPARE(Service::unitName(), QString("warmup.service"));
+    }
+
     void settingsPlaylistRoundTrip()
     {
         QTemporaryDir dir;
@@ -319,6 +358,13 @@ private slots:
         QCOMPARE(store.songs().size(), 2);
         QCOMPARE(store.songs().first().title, QString("One"));
         QCOMPARE(store.songs().first().durationSeconds, 213);
+
+        // The background service may have written new songs meanwhile.
+        SongStore other(path);
+        other.add(probeSong("/music/Band/Album/three.mp3", "Three"));
+        store.reload();
+        QCOMPARE(store.songs().size(), 3);
+        QVERIFY(store.contains("/music/Band/Album/three.mp3"));
     }
 
     void lookupBodiesSplitIntoChunks()

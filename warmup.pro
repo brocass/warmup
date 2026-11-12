@@ -7,6 +7,7 @@ TEMPLATE = app
 HEADERS += \
     src/backend.h \
     src/metadata.h \
+    src/service.h \
     src/settings.h \
     src/songstore.h \
     src/theme.h \
@@ -16,6 +17,7 @@ SOURCES += \
     src/main.cpp \
     src/backend.cpp \
     src/metadata.cpp \
+    src/service.cpp \
     src/settings.cpp \
     src/songstore.cpp \
     src/theme.cpp \

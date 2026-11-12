@@ -57,6 +57,24 @@ karaoke tracks in advance.
 - Songs outside your music folder are matched by file name and tags; unique
   file names work best.
 
+### Running in the background
+Turn on **Settings (,) → Run in the background** to keep playlists and
+instrumentals up to date after you close the window. The package ships a
+[systemd user service](pkgbuild/warmup.service) that runs `warmup --service`:
+the same update pipeline without a window or display. Nothing needs root —
+the toggle runs `systemctl --user enable warmup.service`.
+
+While the service is running, the window is a live dashboard: it shows the
+queue and lets you drop songs, pause, and change settings, and applying
+settings restarts the service so it picks them up. If the service stops, the
+window takes over the background work automatically. The status dot in
+Settings shows what is happening right now.
+
+```sh
+systemctl --user status warmup.service
+journalctl --user -u warmup.service -f   # what the service is doing
+```
+
 ### Shortcuts
 
 | Key   | Action                        |

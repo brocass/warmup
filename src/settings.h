@@ -26,9 +26,12 @@ public:
     QString karaokePath() const { return m_karaokePath; }
     QString karaokeDirectory() const { return m_karaokeDirectory; }
 
+    bool serviceEnabled() const { return m_serviceEnabled; }
+
     void apply(const QString &helperUrl, const QString &accessKey, const QString &musicRoot, const QString &quality);
     void applyPlaylist(bool enabled, const QString &path);
     void applyKaraoke(bool enabled, const QString &path, const QString &directory);
+    void applyService(bool enabled);
 
     // "192.168.1.20:8765/" becomes "http://192.168.1.20:8765".
     static QString normalizeUrl(QString url);
@@ -54,4 +57,5 @@ private:
     bool m_karaokeEnabled = false;
     QString m_karaokePath;
     QString m_karaokeDirectory;
+    bool m_serviceEnabled = false;
 };

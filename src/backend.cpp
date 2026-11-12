@@ -1,6 +1,10 @@
 #include "backend.h"
 
+#include <QDebug>
+#include <QDateTime>
 #include <QDir>
+#include <QDirIterator>
+#include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QNetworkReply>
@@ -22,9 +26,24 @@ QString dirName(const QString &relPath) {
     const QString dir = QFileInfo(relPath).path();
     return dir == "." ? QString() : dir;
 }
+
+// The service runs for days; don't rewrite an unchanged playlist or cache
+// every tick (an always-on media pool shouldn't see needless writes).
+bool writeIfChanged(const QString &path, const QByteArray &data) {
+    QFile existing(path);
+    if (existing.open(QIODevice::ReadOnly) && existing.readAll() == data)
+        return true;
+    QDir().mkpath(QFileInfo(path).absolutePath());
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly))
+        return false;
+    file.write(data);
+    return file.commit();
+}
 } // namespace
 
-Backend::Backend(QObject *parent) : QObject(parent), m_store(qEnvironmentVariable("WARMUP_STORE_PATH")) {
+Backend::Backend(Mode mode, QObject *parent)
+    : QObject(parent), m_appMode(mode), m_store(qEnvironmentVariable("WARMUP_STORE_PATH")) {
     m_karaokePath = qEnvironmentVariable("WARMUP_KARAOKE_STORE_PATH");
     if (m_karaokePath.isEmpty())
         m_karaokePath = QDir::homePath() + "/.local/share/warmup/karaoke.json";
@@ -45,7 +64,199 @@ Backend::Backend(QObject *parent) : QObject(parent), m_store(qEnvironmentVariabl
         reconnect();
         emit stateChanged();
     });
+
+    if (m_appMode == Mode::Service) {
+        startServiceMode();
+    } else {
+        m_serviceDisabled = qEnvironmentVariableIsSet("WARMUP_DISABLE_SERVICE");
+        if (!m_serviceDisabled) {
+            m_service.refresh();
+            connect(&m_service, &Service::changed, this, [this] { emit serviceChanged(); });
+            // A running service owns the playlists and downloads; this window
+            // then only shows the queue. It takes over again if the service
+            // stops. A service started outside the app is adopted as enabled.
+            if (m_service.state() == Service::State::Active) {
+                m_serviceActive = true;
+                if (!m_settings.serviceEnabled())
+                    m_settings.applyService(true);
+                setStatus(tr("The background service keeps playlists up to date"));
+            }
+            connect(&m_serviceTimer, &QTimer::timeout, this, &Backend::pollService);
+            m_serviceTimer.start(30000);
+        }
+    }
+    cleanupKaraokeTemps();
+
     reconnect();
+}
+
+void Backend::startServiceMode() {
+    qInfo().noquote() << "warmup service: starting";
+    m_serviceTick.setInterval(15 * 60 * 1000);
+    connect(&m_serviceTick, &QTimer::timeout, this, [this] { updatePlaylistInternal(false); });
+    m_serviceTick.start();
+    // Let the helper connection settle before the first (full) check, which
+    // catches everything processed while the machine was off.
+    QTimer::singleShot(15000, this, [this] { updatePlaylistInternal(true); });
+}
+
+void Backend::pollService() {
+    if (m_appMode != Mode::Interactive || m_serviceDisabled)
+        return;
+    m_service.refresh();
+    if (!m_serviceActive)
+        return;
+    if (m_service.state() == Service::State::Active) {
+        m_serviceDownTicks = 0;
+        return;
+    }
+    // systemd auto-restarts a crashed service after RestartSec; wait for a
+    // second poll before taking over so a restart isn't fought over.
+    if (++m_serviceDownTicks >= 2)
+        becomeActive();
+}
+
+void Backend::becomeActive() {
+    if (!m_serviceActive)
+        return;
+    m_serviceActive = false;
+    m_serviceDownTicks = 0;
+    // The service wrote songs.json, ready.json and karaoke.json while this
+    // window was passive; reload them before taking over.
+    reloadStores();
+    emit serviceChanged();
+    setStatus(tr("The background service stopped — Warmup took over"));
+    updatePlaylistInternal(true);
+}
+
+void Backend::restartBackgroundService() {
+    if (!m_serviceActive)
+        return;
+    if (m_service.restart()) {
+        m_serviceDownTicks = 0;
+        setStatus(tr("Background service restarted"));
+    } else {
+        setStatus(tr("Couldn't restart the background service — %1").arg(m_service.detail()));
+    }
+    emit serviceChanged();
+}
+
+void Backend::reloadStores() {
+    m_store.reload();
+    m_readyPaths.clear();
+    loadReady();
+    m_karaoke.clear();
+    loadKaraoke();
+}
+
+// Temp files from downloads interrupted by a crash, a kill, or a settings
+// change. In service mode this process is the only worker, so all are stale;
+// in the window, only old ones (a service may be downloading right now).
+void Backend::cleanupKaraokeTemps() {
+    if (m_appMode == Mode::Interactive && m_serviceActive)
+        return;
+    const QString directory = m_settings.karaokeDirectory();
+    if (directory.isEmpty() || !QFileInfo::exists(directory))
+        return;
+    const QDateTime cutoff = QDateTime::currentDateTime().addSecs(-5 * 60);
+    QDirIterator it(directory, {"*.dl.m4a", "*.tmp.m4a"}, QDir::Files, QDirIterator::Subdirectories);
+    while (it.hasNext()) {
+        const QString path = it.next();
+        if (m_appMode == Mode::Service || QFileInfo(path).lastModified() < cutoff)
+            QFile::remove(path);
+    }
+}
+
+QString Backend::serviceState() const {
+    if (m_appMode == Mode::Service)
+        return "running";
+    if (m_serviceDisabled)
+        return "disabled";
+    if (!m_service.available())
+        return "unavailable";
+    if (m_service.state() == Service::State::Unknown)
+        return "unavailable";
+    if (!m_service.installed())
+        return "notInstalled";
+    switch (m_service.state()) {
+    case Service::State::Active: return "running";
+    case Service::State::Failed: return "failed";
+    case Service::State::Inactive: return m_settings.serviceEnabled() ? "enabled" : "off";
+    default: return "unknown";
+    }
+}
+
+QString Backend::serviceDetail() const {
+    if (m_appMode == Mode::Service || m_serviceDisabled)
+        return {};
+    if (!m_service.available())
+        return tr("systemctl isn't available on this system");
+    if (m_service.state() == Service::State::Unknown)
+        return m_service.detail().isEmpty() ? tr("systemctl didn't answer") : m_service.detail();
+    if (!m_service.installed())
+        return tr("The service file isn't installed. Reinstall Warmup with your package manager.");
+    return m_service.detail();
+}
+
+void Backend::refreshServiceStatus() {
+    if (m_appMode != Mode::Interactive || m_serviceDisabled)
+        return;
+    m_service.refresh();
+}
+
+void Backend::applyServiceEnabled(bool enabled) {
+    if (enabled) {
+        if (m_serviceDisabled) {
+            emit serviceChanged();
+            return;
+        }
+        m_service.refresh();
+        if (!m_service.installed()) {
+            setStatus(tr("The service file isn't installed — reinstall Warmup"));
+            emit serviceChanged();
+            return;
+        }
+        if (!m_service.enable()) {
+            setStatus(tr("Couldn't enable the background service — %1").arg(m_service.detail()));
+            emit serviceChanged();
+            return;
+        }
+        m_settings.applyService(true);
+
+        // If this window is idle, hand over right away; otherwise let the
+        // current work finish and start the service when the window closes.
+        const bool busy = m_lookupRunning || m_karaokeRunning || !m_probes.isEmpty() ||
+                          !m_probeQueue.isEmpty() || !m_playlistProbeQueue.isEmpty() ||
+                          !m_activeReplies.isEmpty() || !m_remuxes.isEmpty() || !m_downloadQueue.isEmpty();
+        if (!busy && m_service.start()) {
+            m_serviceActive = true;
+            m_serviceDownTicks = 0;
+            setStatus(tr("The background service keeps playlists up to date"));
+        } else {
+            setStatus(tr("Background service enabled — it starts when Warmup closes"));
+        }
+    } else {
+        m_settings.applyService(false);
+        if (!m_serviceDisabled)
+            m_service.disable();
+        if (m_serviceActive)
+            becomeActive();
+        else
+            setStatus(tr("Background service disabled"));
+    }
+    emit serviceChanged();
+}
+
+void Backend::prepareForQuit() {
+    if (m_appMode != Mode::Interactive || m_serviceDisabled || m_serviceActive)
+        return;
+    if (!m_settings.serviceEnabled())
+        return;
+    m_service.refresh();
+    if (m_service.state() == Service::State::Active)
+        return;
+    if (!m_service.start())
+        qWarning().noquote() << "warmup: couldn't start the background service:" << m_service.detail();
 }
 
 Backend::~Backend() {
@@ -221,7 +432,8 @@ void Backend::fetchQueue() {
                 fresh = true;
             }
         m_recentPaths = recentPaths;
-        if (m_settings.playlistEnabled() && !recentPaths.isEmpty() && (fresh || firstSnapshot))
+        if (!m_serviceActive && (m_settings.playlistEnabled() || m_settings.karaokeEnabled()) &&
+            !recentPaths.isEmpty() && (fresh || firstSnapshot))
             m_playlistDebounce.start();
     });
 }
@@ -291,13 +503,22 @@ void Backend::cancelJob(const QString &jobId) {
 
 void Backend::applySettings(const QString &helperUrl, const QString &accessKey, const QString &musicRoot,
                             const QString &quality) {
+    const QString oldUrl = m_settings.helperUrl();
+    const QString oldKey = m_settings.accessKey();
+    const QString oldRoot = m_settings.musicRoot();
+    const QString oldQuality = m_settings.quality();
     m_settings.apply(helperUrl, accessKey, musicRoot, quality);
+    if (m_serviceActive && (oldUrl != m_settings.helperUrl() || oldKey != m_settings.accessKey() ||
+                            oldRoot != m_settings.musicRoot() || oldQuality != m_settings.quality()))
+        restartBackgroundService();
 }
 
 void Backend::applyPlaylistSettings(bool enabled, const QString &path) {
     m_settings.applyPlaylist(enabled, path);
     emit stateChanged();
-    if (enabled)
+    if (m_serviceActive)
+        restartBackgroundService();
+    else if (enabled)
         updatePlaylist();
 }
 
@@ -368,7 +589,7 @@ void Backend::probeFinished(QProcess *probe, const QString &path, bool forPlayli
                           : m_statusText + " · " + tr("%n couldn't be read", nullptr, m_probeSkipped));
             m_probeSkipped = 0;
         }
-        if (m_playlistUpdatePending) {
+        if (m_playlistUpdatePending && !m_serviceActive) {
             m_playlistUpdatePending = false;
             startLookups(m_nextLookupFull);
             m_nextLookupFull = false;
@@ -432,7 +653,7 @@ void Backend::flushBatch() {
                 byId.contains(result.value("clientSongId").toString()))
                 accepted.append(byId.value(result.value("clientSongId").toString()));
         }
-        if (!accepted.isEmpty())
+        if (!accepted.isEmpty() && !m_serviceActive)
             m_store.addAll(accepted);
         fetchQueue();
     });
@@ -459,7 +680,9 @@ Backend::Tally Backend::tallyBatchResponse(const QJsonArray &results) {
 void Backend::applyKaraokeSettings(bool enabled, const QString &path, const QString &directory) {
     m_settings.applyKaraoke(enabled, path, directory);
     emit stateChanged();
-    if (enabled)
+    if (m_serviceActive)
+        restartBackgroundService();
+    else if (enabled)
         updatePlaylist();
 }
 
@@ -468,6 +691,10 @@ void Backend::updatePlaylist() {
 }
 
 void Backend::updatePlaylistInternal(bool forceFull) {
+    if (m_serviceActive) {
+        setStatus(tr("The background service keeps playlists up to date"));
+        return;
+    }
     if (!m_settings.isConfigured()) {
         setStatus(tr("Set up the helper connection first — press ,"));
         return;
@@ -563,6 +790,8 @@ QVector<QJsonObject> Backend::buildLookupBodies(const QVector<SongInfo> &songs) 
 }
 
 void Backend::startLookups(bool full) {
+    if (m_serviceActive)
+        return;
     QVector<SongInfo> candidates;
     if (full) {
         m_fullLookupTimer.start();
@@ -652,16 +881,11 @@ void Backend::loadReady() {
         m_readyPaths.insert(value.toString());
 }
 
-void Backend::saveReady() const {
+void Backend::saveReady() {
     QJsonArray array;
     for (const QString &path : m_readyPaths)
         array.append(path);
-    QDir().mkpath(QFileInfo(m_readyStorePath).absolutePath());
-    QSaveFile file(m_readyStorePath);
-    if (file.open(QIODevice::WriteOnly)) {
-        file.write(QJsonDocument(array).toJson(QJsonDocument::Compact));
-        file.commit();
-    }
+    writeIfChanged(m_readyStorePath, QJsonDocument(array).toJson(QJsonDocument::Compact));
 }
 
 QString Backend::playlistPathFor(const QString &filePath, const QString &playlistDir, const QString &musicRoot) {
@@ -1069,17 +1293,12 @@ void Backend::writeKaraokePlaylist() {
     }
 
     const QString path = m_settings.karaokePath();
-    QDir().mkpath(QFileInfo(path).absolutePath());
-    QSaveFile file(path);
-    if (!file.open(QIODevice::WriteOnly)) {
-        setStatus(tr("Can't write the playlist to %1").arg(path));
-        return;
-    }
     const QString playlistDir = QFileInfo(path).absolutePath();
-    file.write(buildM3u(entries, [this, playlistDir](const SongInfo &song) {
-                   return relativeIfInside(m_karaoke.value(song.filePath).instrumentalPath, playlistDir);
-               }).toUtf8());
-    if (!file.commit()) {
+    const QByteArray data = buildM3u(entries, [this, playlistDir](const SongInfo &song) {
+                                       return relativeIfInside(m_karaoke.value(song.filePath).instrumentalPath,
+                                                               playlistDir);
+                                   }).toUtf8();
+    if (!writeIfChanged(path, data)) {
         setStatus(tr("Can't write the playlist to %1").arg(path));
         return;
     }
@@ -1108,7 +1327,7 @@ void Backend::loadKaraoke() {
     }
 }
 
-void Backend::saveKaraoke() const {
+void Backend::saveKaraoke() {
     QJsonObject object;
     for (auto it = m_karaoke.constBegin(); it != m_karaoke.constEnd(); ++it) {
         object.insert(it.key(), QJsonObject{{"instrumentalPath", it->instrumentalPath},
@@ -1118,12 +1337,7 @@ void Backend::saveKaraoke() const {
                                             {"lrcPath", it->lrcPath},
                                             {"lrcSourceMtime", double(it->lrcSourceMtime)}});
     }
-    QDir().mkpath(QFileInfo(m_karaokePath).absolutePath());
-    QSaveFile file(m_karaokePath);
-    if (file.open(QIODevice::WriteOnly)) {
-        file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
-        file.commit();
-    }
+    writeIfChanged(m_karaokePath, QJsonDocument(object).toJson(QJsonDocument::Compact));
 }
 
 QVector<SongInfo> Backend::writePlaylist(const QVector<SongInfo> &ready) {
@@ -1133,18 +1347,12 @@ QVector<SongInfo> Backend::writePlaylist(const QVector<SongInfo> &ready) {
     }
 
     const QString path = m_settings.playlistPath();
-    QDir().mkpath(QFileInfo(path).absolutePath());
-    QSaveFile file(path);
-    if (!file.open(QIODevice::WriteOnly)) {
-        setStatus(tr("Can't write the playlist to %1").arg(path));
-        return ready;
-    }
     const QString directory = QFileInfo(path).absolutePath();
     const QString root = m_settings.musicRoot();
-    file.write(buildM3u(ready, [directory, root](const SongInfo &song) {
-                   return playlistPathFor(song.filePath, directory, root);
-               }).toUtf8());
-    if (!file.commit()) {
+    const QByteArray data = buildM3u(ready, [directory, root](const SongInfo &song) {
+                               return playlistPathFor(song.filePath, directory, root);
+                           }).toUtf8();
+    if (!writeIfChanged(path, data)) {
         setStatus(tr("Can't write the playlist to %1").arg(path));
         return ready;
     }
@@ -1196,6 +1404,8 @@ QString Backend::healthSummary() const {
 void Backend::setStatus(const QString &text) {
     if (text == m_statusText)
         return;
+    if (m_appMode == Mode::Service)
+        qInfo().noquote() << "warmup:" << text;
     m_statusText = text;
     emit statusTextChanged();
 }

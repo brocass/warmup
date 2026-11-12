@@ -10,6 +10,7 @@
 #include <QVariantList>
 
 #include "metadata.h"
+#include "service.h"
 #include "settings.h"
 #include "songstore.h"
 
@@ -51,9 +52,18 @@ class Backend : public QObject {
     Q_PROPERTY(QString karaokePath READ karaokePath NOTIFY stateChanged)
     Q_PROPERTY(QString karaokeDirectory READ karaokeDirectory NOTIFY stateChanged)
     Q_PROPERTY(int downloadsLeft READ downloadsLeft NOTIFY downloadsChanged)
+    Q_PROPERTY(bool serviceEnabled READ serviceEnabled NOTIFY serviceChanged)
+    Q_PROPERTY(bool serviceInstalled READ serviceInstalled NOTIFY serviceChanged)
+    Q_PROPERTY(QString serviceState READ serviceState NOTIFY serviceChanged)
+    Q_PROPERTY(QString serviceDetail READ serviceDetail NOTIFY serviceChanged)
 
 public:
-    explicit Backend(QObject *parent = nullptr);
+    enum class Mode {
+        Interactive, // the window: watches the queue and does the work itself
+        Service,     // headless: does the work, no QML or display needed
+    };
+
+    explicit Backend(Mode mode = Mode::Interactive, QObject *parent = nullptr);
     ~Backend() override;
 
     bool configured() const { return m_settings.isConfigured(); }
@@ -77,6 +87,10 @@ public:
     int downloadsLeft() const {
         return m_karaokeChunksLeft + m_downloadQueue.size() + m_activeReplies.size() + m_remuxes.size();
     }
+    bool serviceEnabled() const { return m_settings.serviceEnabled(); }
+    bool serviceInstalled() const { return m_service.installed(); }
+    QString serviceState() const;
+    QString serviceDetail() const;
 
     Q_INVOKABLE void enqueueUrls(const QList<QUrl> &urls);
     Q_INVOKABLE void togglePause();
@@ -86,6 +100,11 @@ public:
     Q_INVOKABLE void applyPlaylistSettings(bool enabled, const QString &path);
     Q_INVOKABLE void applyKaraokeSettings(bool enabled, const QString &path, const QString &directory);
     Q_INVOKABLE void updatePlaylist(); // manual trigger: full readiness check
+    Q_INVOKABLE void applyServiceEnabled(bool enabled);
+    Q_INVOKABLE void refreshServiceStatus();
+    // Called when the window closes: if the service is enabled and isn't
+    // already running, hand the background work over to systemd.
+    void prepareForQuit();
 
     // Static, so tests can drive them without a server.
     static QJsonObject songToJson(const SongInfo &song);
@@ -108,6 +127,7 @@ signals:
     void statusTextChanged();
     void probingChanged();
     void downloadsChanged();
+    void serviceChanged();
 
 private:
     QNetworkRequest request(const QString &path) const;
@@ -131,8 +151,17 @@ private:
     void startLookups(bool full);
     void writeFromReady();
     void loadReady();
-    void saveReady() const;
+    void saveReady();
     QVector<SongInfo> writePlaylist(const QVector<SongInfo> &ready);
+
+    // The background service. The window is a dashboard while the service is
+    // running; when it stops (or is turned off) the window takes over.
+    void startServiceMode();
+    void pollService();
+    void becomeActive();
+    void restartBackgroundService();
+    void reloadStores();
+    void cleanupKaraokeTemps();
 
     // The karaoke library: instrumentals downloaded from the helper, remuxed
     // with the original tags, with the original .lrc copied beside them.
@@ -151,12 +180,20 @@ private:
     void checkKaraokeDone();
     void writeKaraokePlaylist();
     void loadKaraoke();
-    void saveKaraoke() const;
+    void saveKaraoke();
 
     Settings m_settings;
     QNetworkAccessManager m_nam;
     QTimer m_healthTimer, m_queueTimer;
     bool m_blocked = false; // the key was rejected; wait for new settings
+
+    Mode m_appMode;
+    Service m_service;
+    QTimer m_serviceTimer; // polls a running service in the window
+    QTimer m_serviceTick;  // drives the headless service's periodic updates
+    bool m_serviceActive = false; // the service is doing the work, not this process
+    int m_serviceDownTicks = 0;
+    bool m_serviceDisabled = false; // tests/harness: never touch systemd
 
     bool m_connected = false;
     bool m_paused = false;

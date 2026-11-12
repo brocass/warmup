@@ -21,6 +21,9 @@ public:
     SongInfo get(const QString &filePath) const;
     void add(const SongInfo &song);
     void addAll(const QVector<SongInfo> &songs);
+    // Picks up entries another process (the background service) wrote, after
+    // that process handed the work back to this one.
+    void reload();
 
     static QString defaultPath();
     // The store mirrors the whole library after a full scan, so it needs
@@ -31,6 +34,7 @@ signals:
     void changed();
 
 private:
+    void load();
     void save();
 
     QString m_path;

@@ -5,5 +5,5 @@ TEMPLATE = app
 
 INCLUDEPATH += ../src
 
-HEADERS += ../src/backend.h ../src/metadata.h ../src/settings.h ../src/songstore.h ../src/theme.h ../src/translator.h
-SOURCES += warmup_tests.cpp ../src/backend.cpp ../src/metadata.cpp ../src/settings.cpp ../src/songstore.cpp ../src/theme.cpp ../src/translator.cpp
+HEADERS += ../src/backend.h ../src/metadata.h ../src/service.h ../src/settings.h ../src/songstore.h ../src/theme.h ../src/translator.h
+SOURCES += warmup_tests.cpp ../src/backend.cpp ../src/metadata.cpp ../src/service.cpp ../src/settings.cpp ../src/songstore.cpp ../src/theme.cpp ../src/translator.cpp

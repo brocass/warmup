@@ -86,9 +86,19 @@ Settings::Settings(const QString &configPath, QObject *parent)
     const QString envKaraokeDirectory = qEnvironmentVariable("WARMUP_KARAOKE_DIRECTORY").trimmed();
     if (!envKaraokeDirectory.isEmpty())
         m_karaokeDirectory = envKaraokeDirectory;
+
+    m_serviceEnabled = object.value("serviceEnabled").toBool();
+    const QString envService = qEnvironmentVariable("WARMUP_SERVICE_ENABLED").trimmed();
+    if (!envService.isEmpty())
+        m_serviceEnabled = envService == "1" || envService == "true";
 }
 
 QString Settings::defaultPath() {
+    // Tests and the offscreen harness keep their configuration out of the
+    // real user profile.
+    const QString override = qEnvironmentVariable("WARMUP_CONFIG_PATH").trimmed();
+    if (!override.isEmpty())
+        return override;
     return QDir::homePath() + "/.config/warmup/config.json";
 }
 
@@ -161,6 +171,14 @@ void Settings::applyKaraoke(bool enabled, const QString &path, const QString &di
     emit changed();
 }
 
+void Settings::applyService(bool enabled) {
+    if (enabled == m_serviceEnabled)
+        return;
+    m_serviceEnabled = enabled;
+    save();
+    emit changed();
+}
+
 void Settings::save() {
     QDir().mkpath(QFileInfo(m_path).absolutePath());
     // QSaveFile writes beside the target and renames on commit, so a crash
@@ -175,7 +193,8 @@ void Settings::save() {
                                  {"playlistPath", m_playlistPath},
                                  {"karaokeEnabled", m_karaokeEnabled},
                                  {"karaokePath", m_karaokePath},
-                                 {"karaokeDirectory", m_karaokeDirectory}};
+                                 {"karaokeDirectory", m_karaokeDirectory},
+                                 {"serviceEnabled", m_serviceEnabled}};
         file.write(QJsonDocument(object).toJson(QJsonDocument::Compact));
         file.commit();
     }

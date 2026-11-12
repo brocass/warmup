@@ -9,6 +9,10 @@
 
 SongStore::SongStore(const QString &path, QObject *parent)
     : QObject(parent), m_path(path.isEmpty() ? defaultPath() : path) {
+    load();
+}
+
+void SongStore::load() {
     QFile file(m_path);
     if (!file.open(QIODevice::ReadOnly))
         return;
@@ -20,6 +24,13 @@ SongStore::SongStore(const QString &path, QObject *parent)
         m_index.insert(song.filePath, m_songs.size());
         m_songs.append(song);
     }
+}
+
+void SongStore::reload() {
+    m_songs.clear();
+    m_index.clear();
+    load();
+    emit changed();
 }
 
 QString SongStore::defaultPath() {
