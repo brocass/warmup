@@ -17,6 +17,9 @@ namespace {
 // under it too rather than testing an undocumented limit.
 constexpr int kBatchSize = 200;
 constexpr int kMaxProbes = 4;
+// Songs that become ready show up in the helper's recent list, so the
+// whole-library sweep is only a backstop for anything that fell out of it.
+constexpr qint64 kFullLookupIntervalSecs = 6 * 60 * 60;
 
 QString baseName(const QString &relPath) {
     return QFileInfo(relPath).fileName();
@@ -95,9 +98,10 @@ void Backend::startServiceMode() {
     m_serviceTick.setInterval(15 * 60 * 1000);
     connect(&m_serviceTick, &QTimer::timeout, this, [this] { updatePlaylistInternal(false); });
     m_serviceTick.start();
-    // Let the helper connection settle before the first (full) check, which
-    // catches everything processed while the machine was off.
-    QTimer::singleShot(15000, this, [this] { updatePlaylistInternal(true); });
+    // Let the helper connection settle, then do the cheap queue check. On a
+    // big library a full readiness sweep takes many minutes, so it runs after
+    // that instead of holding up the songs that just became ready.
+    QTimer::singleShot(15000, this, [this] { updatePlaylistInternal(false); });
 }
 
 void Backend::pollService() {
@@ -722,7 +726,6 @@ void Backend::updatePlaylistInternal(bool forceFull) {
     // queue's recent list — by walking the whole music folder. New files are
     // probed so the readiness lookup has their title and duration. Walking is
     // cheap, but on a big or remote library it isn't free, so it's throttled.
-    bool foundNew = false;
     if (!m_libraryScanTimer.isValid() || m_libraryScanTimer.elapsed() > 10 * 60 * 1000) {
         m_libraryScanTimer.start();
         const QString karaokeRoot = QDir::cleanPath(m_settings.karaokeDirectory());
@@ -733,8 +736,8 @@ void Backend::updatePlaylistInternal(bool forceFull) {
                 continue;
             if (!m_store.contains(file) && !queued.contains(file)) {
                 m_playlistProbeQueue.append(file);
+                m_lookupExtra.insert(file);
                 queued.insert(file);
-                foundNew = true;
             }
         }
     }
@@ -749,7 +752,7 @@ void Backend::updatePlaylistInternal(bool forceFull) {
             continue;
         if (QFileInfo::exists(filePath)) {
             m_playlistProbeQueue.append(filePath);
-            foundNew = true;
+            m_lookupExtra.insert(filePath);
         } else {
             SongInfo song;
             song.filePath = filePath;
@@ -762,17 +765,35 @@ void Backend::updatePlaylistInternal(bool forceFull) {
         m_store.addAll(known);
 
     // A full check of the whole library is expensive (seconds per 200-song
-    // chunk on the helper), so it runs on demand, hourly, and whenever new
-    // songs were found; routine "a song became ready" events only re-check
-    // the fresh ones and merge into the cached ready set.
-    m_nextLookupFull = forceFull || foundNew || !m_fullLookupTimer.isValid() ||
-                       m_fullLookupTimer.elapsed() > 60 * 60 * 1000;
+    // chunk on the helper), so it runs on demand and every few hours. Routine
+    // checks only re-check the fresh queue sightings and newly found files,
+    // and merge into the cached ready set.
     if (!m_playlistProbeQueue.isEmpty()) {
         m_playlistUpdatePending = true;
         pumpProbes();
         emit probingChanged();
         return;
     }
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    bool wantFull = forceFull || m_lastFullEpoch == 0 ||
+                    now - m_lastFullEpoch > kFullLookupIntervalSecs;
+    if (m_startupCheck) {
+        // The first check after launch is the cheap one, so songs that just
+        // became ready show up in seconds even on a big library. A sweep that
+        // is due follows once that has been written.
+        m_startupCheck = false;
+        if (wantFull && !forceFull) {
+            wantFull = false;
+            // A manual check or a fresh install may cover the library first;
+            // only sweep if that hasn't happened by the time this fires.
+            QTimer::singleShot(60 * 1000, this, [this] {
+                if (m_lastFullEpoch == 0 ||
+                    QDateTime::currentSecsSinceEpoch() - m_lastFullEpoch > kFullLookupIntervalSecs)
+                    updatePlaylistInternal(true);
+            });
+        }
+    }
+    m_nextLookupFull = wantFull;
     startLookups(m_nextLookupFull);
     m_nextLookupFull = false;
 }
@@ -794,15 +815,19 @@ void Backend::startLookups(bool full) {
         return;
     QVector<SongInfo> candidates;
     if (full) {
-        m_fullLookupTimer.start();
         for (const auto &song : m_store.songs())
             if (song.durationSeconds > 0) // invalid entries fail the whole chunk
                 candidates.append(song);
     } else {
-        // Just the fresh queue sightings we have real metadata for; entries
-        // without it are force-included through the recent union anyway.
-        for (const QString &relPath : m_recentPaths) {
-            const SongInfo song = m_store.get(m_settings.musicRoot() + "/" + relPath);
+        // Just the fresh queue sightings and newly found files we have real
+        // metadata for; entries without it are force-included through the
+        // recent union anyway.
+        QSet<QString> check;
+        for (const QString &relPath : m_recentPaths)
+            check.insert(m_settings.musicRoot() + "/" + relPath);
+        check.unite(m_lookupExtra);
+        for (const QString &filePath : check) {
+            const SongInfo song = m_store.get(filePath);
             if (song.durationSeconds > 0 && !m_readyPaths.contains(song.filePath))
                 candidates.append(song);
         }
@@ -816,8 +841,11 @@ void Backend::startLookups(bool full) {
         m_readyPaths.unite(recentUnion);
 
     if (candidates.isEmpty()) {
-        if (full)
+        if (full) {
             m_readyPaths = recentUnion;
+            m_lastFullEpoch = QDateTime::currentSecsSinceEpoch();
+            m_lookupExtra.clear();
+        }
         saveReady();
         writeFromReady();
         return;
@@ -828,23 +856,38 @@ void Backend::startLookups(bool full) {
     m_lookupRunning = true;
     m_lookupFailed = false;
     m_lookupChunksLeft = (candidates.size() + kBatchSize - 1) / kBatchSize;
+    const int lookupChunks = m_lookupChunksLeft;
+    const int lookupSongs = candidates.size();
     auto collected = QSharedPointer<QSet<QString>>::create();
     postChunks("/v1/stems/lookup", buildLookupBodies(candidates), 3, 120000,
-               [this, collected](const QJsonValue &response) {
+               [this, collected, lookupChunks, lookupSongs](const QJsonValue &response) {
                    for (const auto &value : response.toArray()) {
                        const QJsonObject result = value.toObject();
                        if (result.value("ready").toBool())
                            collected->insert(result.value("clientSongId").toString());
                    }
                    --m_lookupChunksLeft;
+                   // A full sweep takes minutes on a big library; say how far
+                   // it has got so the journal doesn't look stuck.
+                   const int done = lookupChunks - m_lookupChunksLeft;
+                   if (m_appMode == Mode::Service && m_lookupChunksLeft > 0 && done % 10 == 0)
+                       qInfo().noquote() << QStringLiteral("warmup: checked %1 of %2 songs…")
+                                                .arg(qMin(done * kBatchSize, lookupSongs))
+                                                .arg(lookupSongs);
                },
                [this, collected, full, recentUnion] {
                    m_lookupRunning = false;
                    if (full) {
                        m_readyPaths = *collected;
                        m_readyPaths.unite(recentUnion);
+                       m_lastFullEpoch = QDateTime::currentSecsSinceEpoch();
+                       m_lookupExtra.clear();
                    } else {
                        m_readyPaths.unite(*collected);
+                       // Newly found files were looked up once; anything that
+                       // becomes ready later shows up in the queue's recent
+                       // list, so there is no need to keep re-checking them.
+                       m_lookupExtra.clear();
                    }
                    saveReady();
                    writeFromReady();
@@ -876,16 +919,29 @@ void Backend::loadReady() {
     QFile file(m_readyStorePath);
     if (!file.open(QIODevice::ReadOnly))
         return;
-    const QJsonArray array = QJsonDocument::fromJson(file.readAll()).array();
+    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+    // Older versions stored a bare array; current ones add when the whole
+    // library was last checked. A freshly written array is a good enough
+    // stand-in on upgrade, so the first start doesn't redo a long sweep.
+    const QJsonArray array = doc.isArray() ? doc.array() : doc.object().value("ready").toArray();
     for (const auto &value : array)
         m_readyPaths.insert(value.toString());
+    if (doc.isObject())
+        m_lastFullEpoch = qint64(doc.object().value("lastFull").toDouble());
+    else if (doc.isArray())
+        m_lastFullEpoch = QFileInfo(m_readyStorePath).lastModified().toSecsSinceEpoch();
 }
 
 void Backend::saveReady() {
+    // Sorted so an unchanged set produces an identical file and doesn't get
+    // rewritten on every service tick.
+    QStringList paths(m_readyPaths.begin(), m_readyPaths.end());
+    paths.sort();
     QJsonArray array;
-    for (const QString &path : m_readyPaths)
+    for (const QString &path : paths)
         array.append(path);
-    writeIfChanged(m_readyStorePath, QJsonDocument(array).toJson(QJsonDocument::Compact));
+    const QJsonObject state{{"ready", array}, {"lastFull", double(m_lastFullEpoch)}};
+    writeIfChanged(m_readyStorePath, QJsonDocument(state).toJson(QJsonDocument::Compact));
 }
 
 QString Backend::playlistPathFor(const QString &filePath, const QString &playlistDir, const QString &musicRoot) {
@@ -1274,7 +1330,7 @@ void Backend::checkKaraokeDone() {
     emit downloadsChanged();
     if (m_playlistUpdatePending) {
         m_playlistUpdatePending = false;
-        updatePlaylist();
+        updatePlaylistInternal(false);
     }
 }
 

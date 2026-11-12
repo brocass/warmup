@@ -220,11 +220,15 @@ private:
     bool m_seenQueueSnapshot = false;
     QTimer m_playlistDebounce;
     QElapsedTimer m_libraryScanTimer; // throttles full music-folder walks
-    QElapsedTimer m_fullLookupTimer;  // throttles full-library readiness checks
+    // When the whole library was last checked for readiness, persisted in
+    // ready.json so a service restart doesn't start the sweep from scratch.
+    qint64 m_lastFullEpoch = 0;
+    bool m_startupCheck = true; // the first check after launch is the cheap one
     bool m_playlistUpdatePending = false;
     bool m_nextLookupFull = false;
     bool m_lookupRunning = false;
     bool m_lookupFailed = false;
+    QSet<QString> m_lookupExtra; // files found in the library scan, checked once
     int m_lookupChunksLeft = 0;
     QSet<QString> m_readyPaths; // cached and persisted: the helper's processed songs
     QString m_readyStorePath;

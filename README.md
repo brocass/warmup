@@ -70,6 +70,11 @@ settings restarts the service so it picks them up. If the service stops, the
 window takes over the background work automatically. The status dot in
 Settings shows what is happening right now.
 
+Songs that become ready are picked up within seconds. A check of the whole
+library runs every few hours to find anything prepared while Warmup was off,
+so on a very large collection the first run after a long break can take a
+few minutes before every older song is listed.
+
 ```sh
 systemctl --user status warmup.service
 journalctl --user -u warmup.service -f   # what the service is doing

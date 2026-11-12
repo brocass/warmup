@@ -1,5 +1,5 @@
 pkgname=warmup
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc='Prepare Narjo Sing stems ahead of time'
 arch=('x86_64' 'aarch64')

@@ -29,14 +29,14 @@ int main(int argc, char *argv[]) {
         // display, so it works from a TTY and at login.
         QCoreApplication app(argc, argv);
         app.setApplicationName("warmup");
-        app.setApplicationVersion("0.6.0");
+        app.setApplicationVersion("0.6.1");
         Backend backend(Backend::Mode::Service);
         return app.exec();
     }
 
     QGuiApplication app(argc, argv);
     app.setApplicationName("warmup");
-    app.setApplicationVersion("0.6.0");
+    app.setApplicationVersion("0.6.1");
 
     // Matches the window to warmup.desktop, so the compositor (Wayland
     // app_id) and the launcher pick up the installed icon.
